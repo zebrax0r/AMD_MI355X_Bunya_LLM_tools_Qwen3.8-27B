@@ -40,6 +40,21 @@ export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/scratch/user/$USER/qwen38-27b/hf-cac
 # — the images are different builds and you do not want them fighting.
 export SIF_PATH="${SIF_PATH:-}"
 
+# Where aiter's merged tuned-GEMM configs go. Bound over /tmp/aiter_configs
+# inside the container, because aiter HARDCODES that path (aiter/jit/core.py:
+# `config_path = Path("/tmp/aiter_configs/")`, with no env var) and Apptainer
+# mounts the HOST's /tmp. On a shared node the first user to import aiter owns
+# that directory and everyone else gets
+#
+#   [Errno 13] Permission denied: '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'
+#
+# ...during MODULE IMPORT, which SGLang swallows as "Ignore import error when
+# loading sglang.srt.models.*". The model registry then comes up EMPTY: 'check'
+# reports it cannot find Qwen3_5ForConditionalGeneration, and 'serve' fails to
+# resolve the architecture at all. Hit for real on bun160, 23 Aug 2026.
+# Empty = $MODEL_CACHE_DIR/aiter-configs, which is what you want.
+export AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-}"
+
 # A Hugging Face token, if any of your chosen checkpoints are gated. Prefer the
 # FILE form: a token in the environment ends up in `ps`, in job scripts, and in
 # pasted logs.  chmod 600 the file.

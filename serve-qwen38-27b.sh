@@ -126,7 +126,8 @@ fi
 SHADOW_VARS=(MODEL_ID MODEL_CACHE_DIR SGLANG_IMAGE WEIGHTS_GB SERVED_MODEL_NAME
              SPECULATIVE TP_SIZE CONTEXT_LEN MEM_FRACTION SIF_PATH
              KV_CACHE_DTYPE MAX_RUNNING_REQUESTS ENABLE_MULTIMODAL
-             REPLAYSSM_SPEC REPLAYSSM_DECODE MAMBA_RADIX_STRATEGY)
+             REPLAYSSM_SPEC REPLAYSSM_DECODE MAMBA_RADIX_STRATEGY
+             AITER_CONFIG_DIR)
 SHADOWED=()
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -1065,6 +1066,54 @@ mkdir -p "$MODEL_CACHE_DIR" 2>/dev/null || true
 [[ -d "$MODEL_CACHE_DIR" && -w "$MODEL_CACHE_DIR" ]] \
     || die "MODEL_CACHE_DIR '$MODEL_CACHE_DIR' does not exist or is not writable."
 
+# ── aiter's /tmp/aiter_configs trap ─────────────────────────────────────────
+#
+# HIT FOR REAL ON BUN160, 23 AUG 2026. Every SGLang model module failed to
+# import with
+#
+#   Ignore import error when loading sglang.srt.models.<x>:
+#   [Errno 13] Permission denied: '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'
+#
+# ...so the model registry came back EMPTY and 'check' could say nothing about
+# whether the image can serve this model. Left alone it breaks 'serve' too:
+# SGLang cannot resolve Qwen3_5ForConditionalGeneration from an empty registry.
+#
+# The cause is in aiter, not in SGLang and not in the image. aiter/jit/core.py
+# merges the per-model tuned-GEMM CSVs into a scratch directory:
+#
+#     config_path = Path("/tmp/aiter_configs/")      # HARDCODED
+#     ...
+#     lock_path = f"{new_file_path}.lock"
+#     mp_lock(lock_path, write_config)
+#
+# There is no environment variable for that path — unlike every other aiter
+# config location, which is an os.getenv with a default. And Apptainer
+# bind-mounts the HOST's /tmp into the container by default. So on a shared
+# node the first user to import aiter creates /tmp/aiter_configs owned by
+# themselves, and every other user then fails to write the lock file inside it.
+# mkdir(exist_ok=True) succeeds, which is why the failure surfaces one line
+# later as a permission error on the .lock rather than on the directory.
+#
+# Fix: bind a private directory over that exact path. Surgical — nothing else
+# about /tmp changes, so the host's /tmp stays visible for everything else.
+AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$MODEL_CACHE_DIR/aiter-configs}"
+mkdir -p "$AITER_CONFIG_DIR" 2>/dev/null || true
+[[ -d "$AITER_CONFIG_DIR" && -w "$AITER_CONFIG_DIR" ]] \
+    || die "AITER_CONFIG_DIR '$AITER_CONFIG_DIR' does not exist or is not writable.
+  This is bound over /tmp/aiter_configs inside the container because aiter
+  hardcodes that path and cannot write there on a shared node."
+# The bind DESTINATION has to exist, and since Apptainer mounts the host's /tmp
+# that means it has to exist on the host. If another user already made it this
+# is a no-op; if nobody has, we make it. Either way the mountpoint is there and
+# our private directory lands on top of it.
+mkdir -p /tmp/aiter_configs 2>/dev/null || true
+CONFIG_BIND=(--bind "$AITER_CONFIG_DIR":/tmp/aiter_configs)
+
+# Every probe gets it too — an import that dies here reports 'no architectures
+# registered', which reads as "this image cannot serve the model" when in fact
+# nothing was tested.
+PROBE_ENV+=("${CONFIG_BIND[@]}")
+
 SIF_PATH="${SIF_PATH:-$MODEL_CACHE_DIR/qwen38-27b-mi355x.sif}"
 # SIF_PATH must name a .sif FILE, not a directory. If it points at a directory
 # (or ends with '/'), treat it as a folder and drop the default filename in —
@@ -1396,13 +1445,13 @@ if [[ "$MODE" == "gpucheck" ]]; then
     # it — the .seeded marker records the in-image target. Testing a container
     # configured differently from the one we launch is how a read-only-.sif bug
     # survives several attempts.
-    probe_extra=()
+    probe_extra=(${CONFIG_BIND[@]+"${CONFIG_BIND[@]}"})
     jit_dir="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
     if [[ -f "$jit_dir/.seeded" ]]; then
         jit_target="$(cut -d'|' -f2 "$jit_dir/.seeded" 2>/dev/null || true)"
         if [[ "$jit_target" == /* ]]; then
-            probe_extra=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
-                         --bind "$jit_dir":"$jit_target")
+            probe_extra+=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
+                          --bind "$jit_dir":"$jit_target")
             log "Probing with the aiter JIT bind: $jit_dir -> $jit_target"
         fi
     fi
@@ -2727,6 +2776,7 @@ prefetch_env=()
 
 base_args=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
     ${cache_bind[@]+"${cache_bind[@]}"}
+    ${CONFIG_BIND[@]+"${CONFIG_BIND[@]}"}
     ${shim_args[@]+"${shim_args[@]}"}
     ${presharded_bind[@]+"${presharded_bind[@]}"}
     --env HF_HOME="$MODEL_CACHE_DIR"
@@ -2822,6 +2872,24 @@ if [[ "${AITER_JIT_TARGET:-}" == /* ]]; then
     log "Preflight OK: $AITER_JIT_TARGET is writable in the container."
 else
     warn "No aiter JIT bind — startup will likely die at CUDA-graph capture."
+fi
+
+# Same idea for aiter's hardcoded /tmp/aiter_configs. This one is cheaper to
+# check and more likely to bite, because it fires during MODULE IMPORT — before
+# any weight is read — and SGLang swallows it as "Ignore import error", leaving
+# an empty model registry and a confusing failure much later.
+cfg_probe="/tmp/aiter_configs/.write-test.$$"
+if ! cfg_err="$(apptainer "${apptainer_args[@]}" "$SIF_PATH" \
+        sh -c "touch '$cfg_probe' && rm -f '$cfg_probe'" 2>&1)"; then
+    die "/tmp/aiter_configs is NOT writable inside the container.
+  Bind attempted : ${CONFIG_BIND[*]:-<none>}
+  Container said : ${cfg_err:-<no output>}
+  aiter hardcodes this path (aiter/jit/core.py) and Apptainer mounts the host's
+  /tmp, so on a shared node another user's directory blocks yours. Every SGLang
+  model module then fails to import and the registry comes up EMPTY.
+  Set AITER_CONFIG_DIR in qwen38-27b.env to a writable path on scratch."
+else
+    log "Preflight OK: /tmp/aiter_configs is writable in the container."
 fi
 
 # The log is world-readable on scratch and gets pasted into bug reports, so

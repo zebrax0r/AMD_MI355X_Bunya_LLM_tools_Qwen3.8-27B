@@ -443,6 +443,42 @@ log line mentions.
 
 **Benchmarking without a control.** `lanes` includes one for a reason.
 
+**aiter's hardcoded `/tmp/aiter_configs`.** Seen on bun160, 23 Aug 2026. Every
+SGLang model module fails to import with
+
+```
+Ignore import error when loading sglang.srt.models.<x>:
+[Errno 13] Permission denied: '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'
+```
+
+and the model registry comes up **empty** — so `check` says it cannot find
+`Qwen3_5ForConditionalGeneration`, which reads like "this image cannot serve the
+model" when in fact nothing was tested. Left alone it breaks `serve` too, for the
+same reason.
+
+The cause is in aiter, not SGLang and not the image. `aiter/jit/core.py` merges
+the per-model tuned-GEMM CSVs into a scratch directory:
+
+```python
+config_path = Path("/tmp/aiter_configs/")     # hardcoded, no env var
+...
+lock_path = f"{new_file_path}.lock"
+mp_lock(lock_path, write_config)
+```
+
+Every *other* aiter config location is an `os.getenv` with a default; this one
+is not. And Apptainer bind-mounts the **host's** `/tmp`, so on a shared node the
+first user to import aiter creates `/tmp/aiter_configs` owned by themselves and
+everyone else fails to write the lock inside it. `mkdir(exist_ok=True)` succeeds,
+which is why the error surfaces one line later on the `.lock` rather than on the
+directory.
+
+This repo binds a private directory over that exact path (`AITER_CONFIG_DIR`,
+default `$MODEL_CACHE_DIR/aiter-configs`) for every probe *and* for `serve`, and
+preflights it inside the container before launch. Nothing else about `/tmp`
+changes. If you see the error anyway, set `AITER_CONFIG_DIR` to somewhere on
+scratch you own.
+
 ---
 
 ## Running on other hardware
