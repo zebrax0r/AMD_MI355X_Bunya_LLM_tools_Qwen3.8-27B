@@ -1,0 +1,371 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# qwen38-27b.env — configuration for serve-qwen38-27b.sh and bench-qwen38-27b.sh
+#
+#   cp qwen38-27b-env.example qwen38-27b.env
+#   $EDITOR qwen38-27b.env          # set MODEL_CACHE_DIR at minimum
+#
+# The scripts read this file themselves. You do NOT need to source it.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │ READ THIS ONCE                                                            │
+# │                                                                           │
+# │ Every line below is  export VAR="${VAR:-default}"  so that a shell export │
+# │ beats the file. That is deliberate — it is what makes  sbatch --export,   │
+# │ and one-off overrides like  MODEL_ID=... ./serve-qwen38-27b.sh check,     │
+# │ work. It also has one nasty failure mode:                                 │
+# │                                                                           │
+# │   $ source qwen38-27b.env      # exports MODEL_ID=<old> into your shell   │
+# │   $ vi qwen38-27b.env          # you change MODEL_ID                      │
+# │   $ source qwen38-27b.env      # ${MODEL_ID:-<new>} sees the OLD export   │
+# │   $ ./serve-qwen38-27b.sh check    # ...so your edit did nothing          │
+# │                                                                           │
+# │ This cost a live debugging session on bun161 on 14 Aug 2026. The scripts  │
+# │ now DETECT it and print exactly which variables are shadowed and the      │
+# │ `unset` line that fixes it — but the cheapest fix is not to source this   │
+# │ file at all. Source it only in a shell that wants $MODEL_CACHE_DIR.       │
+# └───────────────────────────────────────────────────────────────────────────┘
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. REQUIRED — where things live
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Weights, the .sif, the API key, the PID/log files. MUST be on /scratch:
+# /home has a quota you will blow through, and RDM is not designed for this.
+export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/scratch/user/$USER/qwen38-27b/hf-cache}"
+
+# Optional: where the .sif lands. Defaults to $MODEL_CACHE_DIR/qwen38-27b-mi355x.sif.
+# Give it its OWN filename if you also run the 2.4T bundle from the same scratch
+# — the images are different builds and you do not want them fighting.
+export SIF_PATH="${SIF_PATH:-}"
+
+# A Hugging Face token, if any of your chosen checkpoints are gated. Prefer the
+# FILE form: a token in the environment ends up in `ps`, in job scripts, and in
+# pasted logs.  chmod 600 the file.
+export HF_TOKEN_FILE="${HF_TOKEN_FILE:-}"
+# export HF_TOKEN="${HF_TOKEN:-}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. THE MODEL — and why this one
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Qwen shipped exactly two members of the 3.8 family: 27B dense and
+# 2.4T-A95B MoE. There is nothing between them, and no pruned 2.4T fits a
+# single 288 GB card in a state worth serving (the smallest that does, at
+# 170 GiB, is described by its own author as producing gibberish). So on one
+# MI355X the answer is 27B — see the README.
+#
+# The ladder, fastest first. All three fit easily; the difference is DECODE
+# BANDWIDTH, because decode is memory-bound and weight bytes read per token is
+# what sets your token rate:
+#
+#   checkpoint                        size      weights/token   ceiling @ 8 TB/s
+#   amd/Qwen3.8-27B-Quark-AWQ-MXFP4   18.4 GiB   19.8 GB        ~405 tok/s
+#   Qwen/Qwen3.8-27B-FP8              28.7 GiB   30.8 GB        ~260 tok/s
+#   Qwen/Qwen3.8-27B                  51.7 GiB   55.5 GB        ~144 tok/s
+#
+# Those ceilings are arithmetic, not measurements — real single-stream decode
+# lands below them. They are still the right way to rank the rungs.
+#
+# The default is AMD's own Quark AWQ build: OCP MXFP4 W4A4, group 32, E8M0
+# scales — the exact format gfx950 has silicon for. AMD report GSM8K recovery
+# of 101.8% (thinking) / 99.2% (non-thinking) against the BF16 base, so it is
+# not a quality trade in any measurable sense.
+#
+# Two properties of it were verified by reading its safetensors header:
+#   * the VISION TOWER is excluded from quantisation and stays BF16 (333
+#     tensors, 0.86 GiB) — it is a full VLM, not a text-only stub
+#   * the MTP HEAD ships inside it in BF16 (15 tensors) — so NEXTN speculative
+#     decoding needs no second download and no extra HBM
+export MODEL_ID="${MODEL_ID:-amd/Qwen3.8-27B-Quark-AWQ-MXFP4}"
+
+# What clients call it in the `model` field.
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-27b}"
+
+# Probed by './serve-qwen38-27b.sh check' for reachability, size and declared
+# quant_method before you commit to a download.
+export MODEL_CANDIDATES="${MODEL_CANDIDATES:-amd/Qwen3.8-27B-Quark-AWQ-MXFP4 Qwen/Qwen3.8-27B-FP8 Qwen/Qwen3.8-27B}"
+
+# Approximate on-disk size in GB — feeds the free-space preflight and the
+# effective-GB/s readout. CHANGE THIS IF YOU CHANGE MODEL_ID:
+#   MXFP4 20   |   FP8 31   |   BF16 56
+export WEIGHTS_GB="${WEIGHTS_GB:-20}"
+
+# Container image. mi35x = gfx950 = MI350X/MI355X. Do NOT substitute the mi30x
+# build: it targets CDNA3 and a different ROCm, and the MXFP4 kernels will not
+# load. Tags are date-stamped; see the README "Upstream drift".
+export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260822}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. THE SHAPE OF THE SERVER
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ONE GPU. That is the point of this repo. 18.4 GiB of weights on a 288 GB card
+# is 6.4% occupancy, so there is nothing to shard and TP=1 avoids all-reduce
+# entirely. Raise it only if you happen to hold more of the node AND want the
+# extra HBM for KV — the decode gain is sublinear, because you are not
+# bandwidth-starved on one card at this weight size.
+export TP_SIZE="${TP_SIZE:-1}"
+
+export PORT="${PORT:-30000}"
+
+# Empty = the model's native 262,144. This does NOT size the KV pool; it caps
+# what a single request may hold. See './serve-qwen38-27b.sh budget'.
+export CONTEXT_LEN="${CONTEXT_LEN:-}"
+
+# Weights + KV pool as a fraction of the card. A number, or 'auto' to pass no
+# --mem-fraction-static at all and let SGLang derive one.
+#
+# THOSE TWO ARE NOT THE SAME, and the difference runs the opposite way to
+# intuition. SGLang applies a ~7.5% haircut for the vision tower
+# (adjust_mem_fraction_for_vlm), but that call sits INSIDE its
+#     if self.mem_fraction_static is None:
+# branch — so passing an explicit value SKIPS the haircut entirely:
+#
+#   MEM_FRACTION=0.9     ->  0.9000 x 288 = 259.2 GB   (no VLM haircut)
+#   MEM_FRACTION=auto    ->  ~0.88 x 0.9248 x 288 = 234.4 GB
+#
+# Setting it explicitly therefore gives you MORE usable HBM, not less. That is
+# why 0.9 is the default here rather than 'auto'.
+#
+# One further reduction DOES apply either way: x 0.85 if the attention backend
+# resolves to 'aiter' and context > 8192. That one is not inside the None
+# branch. './serve-qwen38-27b.sh budget' models every combination.
+#
+# Lowering this to a "safer" 0.85 costs ~14 GB of serving headroom for nothing.
+export MEM_FRACTION="${MEM_FRACTION:-0.9}"
+
+# Vision on (1) or text-only (0).
+#
+# 0 passes --language-model-only, which skips the multimodal encoder entirely:
+# the tower is never built, its memory goes to KV instead, and multimodal
+# requests are REJECTED rather than silently mishandled. (Note it is not
+# --enable-multimodal: SGLang renders every bool as store_true, so that flag
+# takes no value and cannot express "off".)
+# Verify vision end-to-end with './serve-qwen38-27b.sh vlmcheck'.
+export ENABLE_MULTIMODAL="${ENABLE_MULTIMODAL:-1}"
+
+# Parsers. Qwen3.8 ALWAYS reasons — thinking cannot be switched off, and every
+# reply opens with a <think> block. Get REASONING_PARSER wrong and the server
+# still answers 200 with raw <think> tags glued to the front of `content`;
+# nothing errors, agentic clients just behave strangely.
+# './serve-qwen38-27b.sh toolcheck' asserts both.
+export TOOL_PARSER="${TOOL_PARSER:-qwen3_coder}"
+export REASONING_PARSER="${REASONING_PARSER:-qwen3}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. KV CACHE AND THE GDN STATE POOL — the real capacity question
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Qwen3.8-27B is a HYBRID. Of its 64 layers, 48 are Gated DeltaNet linear
+# attention and 16 are gated full attention (full_attention_interval: 4). The
+# two hold completely different kinds of memory:
+#
+#   FULL ATTENTION (16 layers)   an ordinary KV cache, charged PER TOKEN:
+#       16 x 2 x 4 KV heads x head_dim 256 x 2 B = 64 KiB/token   (BF16)
+#                                                  32 KiB/token   (fp8_e4m3)
+#
+#   GDN (48 layers)              a fixed-size recurrent state, charged PER
+#       REQUEST and identical whether that request holds 100 tokens or 100,000:
+#       per layer, a 10240-wide causal conv (kernel 4) plus a 48x128x128 SSM
+#       state in fp32 = 3.156 MiB;  x 48 layers = 151.5 MiB PER STATE SLOT.
+#       A request holds SEVERAL slots: 5 under extra_buffer ('auto' for this
+#       model), 3 under no_buffer, 1 with the radix cache off.
+#       At 5 slots that is 0.74 GiB of HBM per concurrent request.
+#
+# THE GDN POOL, NOT KV, IS WHAT CAPS CONCURRENCY HERE. With ~239 GB free after
+# weights, 64 concurrent requests spend 47 GiB on GDN state and leave ~175 GiB
+# of KV — about 45k tokens each. Run:
+#
+#     ./serve-qwen38-27b.sh budget
+#
+# It prints the full table for YOUR settings and needs no GPU, no container and
+# no allocation — you can run it on a login node while deciding what to ask
+# SLURM for.
+
+# Empty = BF16 KV. 'fp8_e4m3' halves KV per token and is NATIVE on CDNA4 (not
+# emulated), so it doubles every per-request context figure in 'budget'.
+# Off by default because on a whole card KV is rarely the binding constraint;
+# turn it on when 'budget' shows you are actually KV-limited.
+export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+
+# DEFAULTED TO 64, and this one matters. With speculative decoding on, SGLang's
+# speculative hook pins --max-running-requests to 48 when it is unset — not to
+# anything derived from memory. Since NEXTN is the default here, leaving this
+# empty would silently cap the server at 48 on a card with room for far more.
+# 64 comes from the arithmetic above: 47.3 GiB of GDN state, ~175 GiB of KV
+# left, ~45k tokens per request at BF16 KV. 'budget' marks this row.
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-64}"
+
+# GDN pool shaping. Empty = SGLang's own sizing, which is sane. Set these only
+# after 'budget' has told you which way you want to trade.
+#   no_buffer          3 GDN slots per request instead of 5 -> more concurrency,
+#                      less prefix reuse over the mutable GDN state
+#   extra_buffer       5 slots; the default; best prefix reuse
+export MAMBA_RADIX_STRATEGY="${MAMBA_RADIX_STRATEGY:-}"
+export MAMBA_FULL_MEMORY_RATIO="${MAMBA_FULL_MEMORY_RATIO:-}"
+export MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-}"
+export MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
+
+# Leave empty. On ROCm, Triton is the ONLY linear-attention backend — SGLang's
+# flashinfer / cutedsl / nvidia_kda / ptx_kda paths are all gated behind
+# is_cuda() / is_sm100_supported(). There is nothing to unlock here.
+export LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-}"
+
+# Prefix caching. Leave ON. Turning it off also makes MAMBA_RADIX_STRATEGY
+# inert and drops the GDN budget to 1 slot per request.
+export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. SPECULATIVE DECODING — on by default, and gated
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The 2.4T bundle defaults this OFF, to stay faithful to a verified upstream
+# cell. There is no such cell here — upstream publishes nothing for Qwen3.8-27B
+# on MI355X (their 27B page is H200/FP8) — so the default is chosen on merit,
+# and on merit NEXTN wins: the MTP head is already in the checkpoint, and
+# single-card decode is bandwidth-bound, which is exactly the regime
+# speculative decoding exists to fix.
+#
+# IT IS NOT RECKLESS. ROCm has two speculative-decoding bugs that kill the
+# whole SERVER — not just the offending request — on images that lack the HIP
+# sampling kernels:
+#
+#   sglang #32569   missing top_k / top_p renorm kernels
+#                   -> "TypeError: 'NoneType' object is not callable"
+#   sglang #33694   is_hip() branch claims non-greedy verify but never binds
+#                   tree_speculative_sampling_target_only
+#                   -> "NameError: tree_speculative_sampling_target_only"
+#
+# Qwen's own recommended sampling for this model is temperature=1.0,
+# top_p=0.95, top_k=20 — the DOCUMENTED settings send exactly the affected
+# parameters. So serve-qwen38-27b.sh probes the image and REFUSES TO START
+# rather than warning. Check any image in seconds, without launching:
+#
+#     ./serve-qwen38-27b.sh speccheck
+#
+#   nextn   the checkpoint's own MTP head — no draft download   (default)
+#   dspark  RadixArk/Qwen3.8-27B-DSpark, a separate 2.5 GB trained draft
+#   none    off
+export SPECULATIVE="${SPECULATIVE:-nextn}"
+
+# 'on' = refuse to start on an image that fails the probe above. 'off' = start
+# anyway. Only set 'off' if you control every client and can guarantee greedy
+# sampling (temperature=0, no top_p, no top_k).
+export SPEC_GATE="${SPEC_GATE:-on}"
+
+# Empty = SGLang's own 3/1/4 preset for NEXTN. Move off it deliberately.
+export SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-}"
+export SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-}"
+export SPEC_NUM_DRAFT_TOKENS="${SPEC_NUM_DRAFT_TOKENS:-}"
+export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Qwen3.8-27B-DSpark}"
+export DSPARK_REVISION="${DSPARK_REVISION:-}"
+export DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. THE TWO ReplaySSM FLAGS — pick a lane
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# SGLang has two ReplaySSM paths over the GDN recurrent state. They share ring
+# storage with incompatible cursor protocols, so server_args.py rejects the
+# pair outright — and serve-qwen38-27b.sh catches it before the weights load.
+# BOTH require the Triton linear-attn decode backend, which is what ROCm uses
+# anyway, so unlike the CUDA-only linear-attention backends both are genuinely
+# available here.
+#
+#   LATENCY LANE (the default)
+#       SPECULATIVE=nextn   REPLAYSSM_SPEC=1   REPLAYSSM_DECODE=0
+#     Spec-VERIFY. Replaces per-draft full-state snapshots with a per-slot
+#     raw-input window, so the GDN pool admits more concurrent requests at the
+#     same ratio. Verify output is unchanged — a memory trade, not an accuracy
+#     one. Composes with NEXTN, which is why it is on by default.
+#
+#   THROUGHPUT LANE
+#       SPECULATIVE=none    REPLAYSSM_SPEC=0   REPLAYSSM_DECODE=1
+#       MAMBA_RADIX_STRATEGY=no_buffer   (set for you if left empty/auto)
+#     Buffered DECODE. Upstream claims ~1.2-1.5x GDN decode bandwidth at
+#     batch >= 64. It does nothing for a single stream — measure it at
+#     concurrency or you will conclude it is useless.
+#
+# Which lane wins is an empirical question on this hardware, and nobody has
+# published the answer. './bench-qwen38-27b.sh lanes' runs both.
+export REPLAYSSM_SPEC="${REPLAYSSM_SPEC:-1}"
+export REPLAYSSM_DECODE="${REPLAYSSM_DECODE:-0}"
+export REPLAYSSM_CACHE_LEN="${REPLAYSSM_CACHE_LEN:-}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. aiter — where the gfx950 MXFP4 speed comes from
+# ═══════════════════════════════════════════════════════════════════════════
+
+# SGLANG_USE_AITER=1. Leave on. SGLang's Quark W4A4 MXFP4 scheme routes its
+# GEMMs through aiter's gemm_afp4wfp4 kernels and refuses outright on hardware
+# without FP4 support ("requires gfx95x, e.g. MI355x"), so this is the whole
+# reason the MXFP4 rung is faster than the FP8 one.
+export ENABLE_AITER="${ENABLE_AITER:-1}"
+
+# All default OFF. None is upstream-verified for this model; each is a
+# defaults-off SGLang/aiter knob that looks matched to this architecture.
+# Change ONE at a time and re-bench, or you will not know which one moved.
+export FLYDSL_FORCE="${FLYDSL_FORCE:-0}"
+export ROCM_MULTI_STREAM="${ROCM_MULTI_STREAM:-0}"
+export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-}"
+export AITER_KV_LAYOUT="${AITER_KV_LAYOUT:-}"
+export AITER_FP8_PER_TOKEN="${AITER_FP8_PER_TOKEN:-0}"
+
+# Let aiter skip its rocminfo shell-out. ONE architecture or nothing — a list
+# makes aiter pick the first entry regardless of the actual device
+# (ROCm/aiter#3807).
+export AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. PLUMBING you rarely touch
+# ═══════════════════════════════════════════════════════════════════════════
+
+export ROCM_MODE="${ROCM_MODE:-auto}"           # auto | rocm | devices
+export ROCMINFO_SHIM="${ROCMINFO_SHIM:-auto}"   # auto | off | force
+export SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"  # 0 for SLURM cgroups
+export READY_TIMEOUT="${READY_TIMEOUT:-1800}"   # cold start budget, seconds
+
+# This checkpoint is ONE 18.4 GiB file, so threads buy little — a single file
+# is a single reader. It matters on the FP8 (66 files) and BF16 (18 files) rungs.
+export WEIGHT_LOAD_THREADS="${WEIGHT_LOAD_THREADS:-8}"
+export LOAD_FORMAT="${LOAD_FORMAT:-}"
+export PRESHARDED_PATH="${PRESHARDED_PATH:-}"
+export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
+
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
+export SCHEDULE_POLICY="${SCHEDULE_POLICY:-}"
+export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-}"
+export PAGE_SIZE="${PAGE_SIZE:-}"
+export ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"   # empty = let the model hook choose
+export QUANTIZATION="${QUANTIZATION:-}"             # empty = read from the checkpoint
+export EXTRA_ENGINE_ARGS="${EXTRA_ENGINE_ARGS:-}"
+
+# Benchmarking (bench-qwen38-27b.sh)
+export BENCH_REPEATS="${BENCH_REPEATS:-3}"
+export BENCH_OUT_DIR="${BENCH_OUT_DIR:-./bench}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WHAT IS DELIBERATELY NOT HERE
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# * No NVFP4 checkpoint. Community NVFP4 builds of this model exist and are
+#   smaller, but NVFP4 is a Blackwell format (E4M3 scales, group 16) and is not
+#   what CDNA4 implements. gfx950 does OCP MXFP4: group 32, E8M0. Use the AMD
+#   Quark build, which is the same idea done in the format this silicon has.
+#
+# * No --limit-mm-per-prompt. SGLang derives multimodal limits from the model
+#   config; forcing them here is how you quietly break a working default.
+#
+# * No expectation that any of section 7 helps. Those knobs are plumbed because
+#   they are cheap to plumb and expensive to add later — not because anyone has
+#   measured them on Qwen3.8-27B on gfx950. Nobody has. That includes us.

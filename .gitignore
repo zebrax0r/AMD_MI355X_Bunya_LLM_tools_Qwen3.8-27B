@@ -1,0 +1,10 @@
+qwen38-27b.env
+logs/
+bench/
+*.bak
+*.sif
+q27x-server.pid
+q27x-server.log
+q27x-loadtimes.log
+q27x-api-key
+.rocm-mode
