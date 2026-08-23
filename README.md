@@ -246,39 +246,37 @@ beat the *other lane*, not whether either beat plain SGLang.
 
 ---
 
-## Speculative decoding is ON by default — and gated
+## Speculative decoding: requested by default, auto-disabled on this checkpoint
 
-The 2.4T bundle defaults `SPECULATIVE` off, to stay faithful to a verified
-upstream cell. **There is no such cell here**, so the default is chosen on merit,
-and on merit NEXTN wins: the MTP head is already in the checkpoint, and
-single-card decode is bandwidth-bound, which is exactly the regime speculative
-decoding exists to fix.
+`SPECULATIVE=nextn` is the default, because the MTP head ships inside the
+checkpoint and single-card decode is bandwidth-bound — exactly the regime
+speculative decoding exists to fix.
 
-It is not reckless, because ROCm has two speculative-decoding bugs that kill the
-whole **server** — not just the offending request:
+**But it cannot run on the default MXFP4 checkpoint**, and the script detects
+that and turns it off for you. See
+[NEXTN cannot run on the MXFP4 checkpoint](#nextn-cannot-run-on-the-mxfp4-checkpoint-and-no-flag-fixes-it)
+below for why. You will see this at startup, and it is expected:
+
+```
+[q27x WARN] TURNING SPECULATIVE DECODING OFF — this checkpoint cannot use it.
+```
+
+Nothing else is lost: correctness, vision, context and concurrency are all
+unaffected. If you want MTP, switch to a checkpoint whose head matches its body
+(`Qwen/Qwen3.8-27B-FP8` or `Qwen/Qwen3.8-27B`).
+
+Two ROCm bugs also make speculative decoding unsafe on older images — they kill
+the **server**, not the request:
 
 | Issue | Symptom |
 |---|---|
 | sglang #32569 | missing HIP `top_k`/`top_p` renorm kernels → `TypeError: 'NoneType' object is not callable` |
-| sglang #33694 | `is_hip()` branch claims non-greedy verify but never binds `tree_speculative_sampling_target_only` → `NameError` |
+| sglang #33694 | `is_hip()` claims non-greedy verify but never binds `tree_speculative_sampling_target_only` → `NameError` |
 
-**Qwen's own recommended sampling for this model is `temperature=1.0,
-top_p=0.95, top_k=20`** — the documented settings send exactly the affected
-parameters. You would not have to go looking for these bugs; a normal client
-finds them on the first request.
-
-So `serve-qwen38-27b.sh` probes the image and **refuses to start** rather than
-warning. Check any image in about a second, without launching anything:
-
-```bash
-./serve-qwen38-27b.sh speccheck
-```
-
-Exit codes: `0` safe, `1` unsafe, `2` could not tell (which is treated as
-"proceed", because an unreadable probe is not a failed probe). If you have
-measured the risk and control every client, `SPEC_GATE=off` starts anyway.
-
----
+Qwen's recommended sampling is `temperature=1.0, top_p=0.95, top_k=20`, so a
+normal client trips these on the first request. `./serve-qwen38-27b.sh speccheck`
+answers in about a second without launching anything; the launcher refuses to
+start if the image fails it.
 
 ## Why SGLang here, when the MI210 sibling uses vLLM
 
@@ -315,11 +313,11 @@ nothing to unlock.
 salloc --partition=admin_test --account=a_rcc --qos=sdf \
        --gres=gpu:mi355x:1 --cpus-per-task=24 --mem=200G --time=2:00:00
 
-# 2. Configure
+# 2. Configure — MODEL_CACHE_DIR on /scratch is the only required edit
 cp qwen38-27b-env.example qwen38-27b.env
-$EDITOR qwen38-27b.env          # set MODEL_CACHE_DIR to /scratch
+$EDITOR qwen38-27b.env
 
-# 3. Build the image, then check it BEFORE downloading anything
+# 3. Build the image and check it BEFORE downloading anything
 ./serve-qwen38-27b.sh pull
 ./serve-qwen38-27b.sh speccheck   # is speculative decoding safe on this image?
 ./serve-qwen38-27b.sh gpucheck    # can the container reach the GPU?
@@ -337,7 +335,72 @@ $EDITOR qwen38-27b.env          # set MODEL_CACHE_DIR to /scratch
 
 Or as a batch job: `mkdir -p logs && sbatch serve-qwen38-27b.sbatch`.
 
----
+### Do NOT source the env file
+
+The scripts read `qwen38-27b.env` themselves. Sourcing it exports every value
+into your shell, and an export **beats every later edit to the file** — so the
+file says one thing and the server does another. Both scripts detect this and
+print the `unset` line that fixes it, but the cheapest fix is not to source it.
+Source it only in a shell that wants `$MODEL_CACHE_DIR`.
+
+### If startup fails, in this order
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `0 architectures registered` / `Permission denied: /tmp/aiter_configs/*.lock` | shared-node collision on aiter's hardcoded path | handled automatically; set `AITER_CONFIG_DIR` if it persists |
+| `assert param_data.shape == loaded_weight.shape` in `qwen3_5_mtp.py` | MXFP4 body + BF16 MTP head | handled automatically — NEXTN is disabled |
+| `Cannot find any model weights with <repo id>` | `LOAD_FORMAT=presharded` with no absolute `PRESHARDED_PATH` | unset `LOAD_FORMAT` |
+| `Unrecognized model ... should have a model_type key` | stray `./<org>/<name>/` dir shadowing the repo id | `rm -rf ./<org>` |
+| `TypeError: 'NoneType' object is not callable` on first request | image lacks HIP renorm kernels | `speccheck`, then newer image or `SPECULATIVE=none` |
+| 401 from a client | header not sent | see [Connecting a client](#connecting-a-client-and-the-401-everyone-hits) |
+
+Every one of these is now detected before launch, or fixed automatically. They
+are listed because the underlying causes are worth understanding, not because
+you should expect to hit them.
+
+## Connecting a client (and the 401 everyone hits)
+
+The server requires an API key. It is generated on first start and stored at
+`$MODEL_CACHE_DIR/q27x-api-key`; the startup banner prints the path.
+
+**`Q27X_API_KEY` is read by the scripts in this repo, not by `curl` or by any
+OpenAI client.** Exporting it on your laptop authenticates nothing on its own —
+you have to put it in the request. That is the single commonest cause of a 401.
+
+A 401 is otherwise good news: it means your tunnel works and you reached SGLang.
+
+```bash
+# on Bunya — this is the authoritative value
+cat /scratch/user/$USER/qwen38-27b/hf-cache/q27x-api-key; echo
+
+# on your laptop
+export Q27X_API_KEY='<paste it>'
+ssh -N -L 30000:<node>:30000 $USER@bunya1.rcc.uq.edu.au
+```
+
+curl — note the `Authorization` header, which is the part people leave out:
+
+```bash
+curl -s http://localhost:30000/v1/chat/completions \
+  -H "Authorization: Bearer $Q27X_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b","reasoning_effort":"low",
+       "messages":[{"role":"user","content":"Say hello in one sentence."}]}'
+```
+
+OpenAI SDKs and most tools look for `OPENAI_API_KEY`, not ours:
+
+```bash
+export OPENAI_API_KEY="$Q27X_API_KEY"
+export OPENAI_BASE_URL="http://localhost:30000/v1"
+```
+
+Still 401 with the header set? Then the key does not match the server's. The
+file is authoritative — and note that if a key file already existed, the server
+reused it rather than generating the one you think it did. Watch for a trailing
+newline from an editor, and quote the substitution: `export K="$(cat file)"`.
+
+To rotate: `stop`, `rm` the key file, start again.
 
 ## Verifying it works — and why the checks assert on unguessable values
 
@@ -443,8 +506,9 @@ log line mentions.
 
 **Benchmarking without a control.** `lanes` includes one for a reason.
 
-**NEXTN cannot run on the MXFP4 checkpoint, and no flag fixes it.** Seen on
-bun160, 23 Aug 2026:
+### NEXTN cannot run on the MXFP4 checkpoint, and no flag fixes it
+
+Seen on bun160, 23 Aug 2026:
 
 ```
 parameter.py:223 in load_merged_column_weight
@@ -620,13 +684,25 @@ before switching, and run `speccheck` against it first.
 ## Status of the numbers in this README
 
 Everything about **sizes, shapes and formats** was measured: checkpoint sizes
-come from the Hugging Face tree API, tensor dtypes and the presence of the MTP
-head and vision tower come from reading the safetensors header over HTTP range
-requests, and the layer/head/state arithmetic comes from `config.json`.
+from the Hugging Face tree API, tensor dtypes and the presence of the MTP head
+and vision tower by reading the safetensors header over HTTP range requests, and
+the layer/head/state arithmetic from `config.json`.
 
-Everything about **speed** is either arithmetic (the bandwidth ceilings) or
-upstream's own claim (the ~1.2–1.5× ReplaySSM figure). **No throughput number
-here has been measured on this hardware**, because that requires the allocation
-this repo exists to make easy. When you run it, the results are new information —
-record the node and the date, and set `BENCH_REPEATS=3` before concluding that
-two configurations differ.
+### Verified on bun160, 23 Aug 2026
+
+| | |
+|---|---|
+| GPU passthrough | `ROCM_MODE=rocm`, 1 × gfx950 |
+| Weight load | **18.04 GB** resident, `quant=quark`, ~10–18 s warm |
+| Free after weights | 269.2 GB reported by SGLang |
+| Vision tower | loaded (`aiter_attn` multimodal backend) |
+| Tool calls + reasoning parser | `toolcheck` passes end to end |
+| Speculative decoding | auto-disabled — checkpoint cannot support it |
+
+The 18.04 GB matches the 18.4 GiB predicted from the safetensors header, and
+`budget`'s static-pool arithmetic matches SGLang's own reported free memory.
+
+**No throughput number here has been measured.** The bandwidth ceilings are
+arithmetic and the ~1.2–1.5× ReplaySSM figure is upstream's claim. When you run
+`bench`, those results are new information — record the node and the date, and
+set `BENCH_REPEATS=3` before concluding two configurations differ.

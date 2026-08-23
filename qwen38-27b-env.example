@@ -299,8 +299,6 @@ export SPEC_GATE="${SPEC_GATE:-on}"
 # SPEC_ALLOW_MIXED=1 overrides the guard and fails at weight load instead.
 export SPEC_ALLOW_MIXED="${SPEC_ALLOW_MIXED:-0}"
 
-# OBSOLETE. Ignored, and warned about if set. It never worked.
-export SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-}"
 
 # Empty = SGLang's own 3/1/4 preset for NEXTN. Move off it deliberately.
 export SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-}"
