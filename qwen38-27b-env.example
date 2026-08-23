@@ -264,10 +264,20 @@ export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 #
 #     ./serve-qwen38-27b.sh speccheck
 #
-#   nextn   the checkpoint's own MTP head — no draft download   (default)
+# MEASURED on bun160, 23 Aug 2026 — speculation does not pay on this stack:
+#     MXFP4 + aiter, no spec     96 tok/s   <- the answer
+#     DSpark + triton attention  32 tok/s
+#     FP8 + NEXTN                14 tok/s
+#     DSpark + aiter attention   crash
+#     MXFP4 + NEXTN              will not load (BF16 MTP head, undeclared)
+# Decode here is not bandwidth-bound: 2.25 ms of a 10.44 ms token is weights,
+# 7.2 ms is the GDN recurrence on Triton. Every route to speculation makes the
+# forward pass cost more than it saves.
+#
+#   none    off                                              (default)
+#   nextn   the checkpoint's own MTP head — no draft download
 #   dspark  RadixArk/Qwen3.8-27B-DSpark, a separate 2.5 GB trained draft
-#   none    off
-export SPECULATIVE="${SPECULATIVE:-nextn}"
+export SPECULATIVE="${SPECULATIVE:-none}"
 
 # 'on' = refuse to start on an image that fails the probe above. 'off' = start
 # anyway. Only set 'off' if you control every client and can guarantee greedy

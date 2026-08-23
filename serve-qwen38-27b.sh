@@ -231,25 +231,32 @@ REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 # tower entirely and reclaims the VLM mem-fraction haircut described in 'budget'.
 ENABLE_MULTIMODAL="${ENABLE_MULTIMODAL:-1}"
 
-# ── Speculative decoding — ON BY DEFAULT, unlike the 2.4T bundle ─────────────
+# ── Speculative decoding — OFF BY DEFAULT, and that is a MEASURED choice ────
 #
-# The 2.4T repo defaults this off because there is a verified upstream cell to
-# stay faithful to. Here there is not: upstream publishes no MI355X cell for
-# Qwen3.8-27B at all (their 27B page is H200/FP8). So the default is chosen on
-# merit, and on merit NEXTN wins — the MTP head is already in the checkpoint,
-# costs no extra weights, and decode on a single card is bandwidth-bound, which
-# is exactly the regime speculative decoding exists to fix.
+# This shipped as nextn-by-default on the reasoning that single-card decode is
+# bandwidth-bound and the MTP head is free. Measurement on bun160 (23 Aug 2026)
+# says otherwise, four independent ways:
 #
-# It is NOT reckless: ROCm has two speculative-decoding landmines that kill the
-# whole SERVER (not just the request) on images that lack the HIP renorm and
-# tree-sampling kernels. This script probes for them and REFUSES TO START rather
-# than warning, so the fast default cannot silently become a fragile one.
-# './serve-qwen38-27b.sh speccheck' answers the same question without launching.
+#   MXFP4 + aiter, no spec      96 tok/s   <- the answer
+#   DSpark + triton attention   32 tok/s   (poor draft AND a slower backend)
+#   FP8 + NEXTN                 14 tok/s   (untuned FP8 GEMMs, 23x slower pass)
+#   DSpark + aiter attention    crash      (unguarded custom_mask, upstream bug)
+#   MXFP4 + NEXTN               will not load (BF16 MTP head, undeclared)
 #
-#   nextn   the checkpoint's own MTP head — no draft download   (default)
-#   dspark  RadixArk's trained draft — a separate 2.5 GB repo
-#   none    off
-SPECULATIVE="${SPECULATIVE:-nextn}"
+# The reason none of it pays: decode here is NOT bandwidth-bound. Only 2.25 ms
+# of a 10.44 ms token is weight streaming; 7.2 ms is the Gated DeltaNet
+# recurrence on Triton (48 of 64 layers, no aiter linear-attn path on ROCm,
+# CUDA graphs already on). Speculation amortises the pass, but every route to
+# it on this stack makes the pass more expensive than it saves.
+#
+# So: off. Set SPECULATIVE=nextn if you move to a checkpoint whose MTP head
+# matches its body (Qwen/Qwen3.8-27B BF16 works; the FP8 one loads but is slow
+# here). The mismatch guard below still protects you either way.
+#
+#   none    off                                              (default)
+#   nextn   the checkpoint's own MTP head — no draft download
+#   dspark  RadixArk/Qwen3.8-27B-DSpark, a separate 2.5 GB trained draft
+SPECULATIVE="${SPECULATIVE:-none}"
 # 'on' (default) refuses to start when the image lacks the HIP sampling kernels
 # speculative verify needs. 'off' starts anyway — only sane if you control every
 # client and can guarantee greedy sampling.
@@ -2570,12 +2577,13 @@ if [[ -n "$SPECULATIVE" ]]; then
             [[ -n "$DSPARK_BLOCK_SIZE" ]] \
                 && spec_flags+=(--speculative-dspark-block-size "$DSPARK_BLOCK_SIZE")
             log "DSpark speculative decoding ENABLED (draft: $DSPARK_MODEL)."
-            warn "  DSpark is a separate trained draft (2.5 GB) and is NOT part of any
-  verified MI355X recipe. NEXTN is the better first choice here: its MTP head
-  already ships inside the checkpoint, so it costs no download, no extra HBM,
-  and no second model to keep in sync. Reach for DSpark only after you have
-  measured NEXTN and want to try beating it — and treat any number it gives you
-  as new information, not as a confirmation."
+            warn "  DSpark was MEASURED SLOWER on this model: 32 tok/s against 96 for plain
+  MXFP4 (bun160, 23 Aug 2026). Two independent reasons, both still true:
+    - draft quality: accept rate 0.15-0.36 vs NEXTN's 0.85 on the same model
+    - it CRASHES on the aiter attention backend (unguarded spec_info.custom_mask
+      in aiter_backend.py; the triton backend guards it), and forcing
+      ATTENTION_BACKEND=triton to dodge that made the forward pass 9x slower.
+  Keep it only if you are investigating, not if you want throughput."
             ;;
     esac
 

@@ -246,26 +246,19 @@ beat the *other lane*, not whether either beat plain SGLang.
 
 ---
 
-## Speculative decoding: requested by default, auto-disabled on this checkpoint
+## Speculative decoding: off, and that is a measured choice
 
-`SPECULATIVE=nextn` is the default, because the MTP head ships inside the
-checkpoint and single-card decode is bandwidth-bound — exactly the regime
-speculative decoding exists to fix.
+`SPECULATIVE` defaults to **`none`**. This repo originally shipped `nextn` on the
+reasoning that single-card decode is bandwidth-bound and the MTP head is free.
+Measurement says otherwise — see the
+[scoreboard](#scoreboard--every-configuration-tried). Every route to speculation
+on this stack makes the forward pass cost more than it saves, because decode here
+is **not** bandwidth-bound.
 
-**But it cannot run on the default MXFP4 checkpoint**, and the script detects
-that and turns it off for you. See
-[NEXTN cannot run on the MXFP4 checkpoint](#nextn-cannot-run-on-the-mxfp4-checkpoint-and-no-flag-fixes-it)
-below for why. You will see this at startup, and it is expected:
+If you move to a checkpoint whose MTP head matches its body, `SPECULATIVE=nextn`
+is worth retrying — the guard below protects you either way.
 
-```
-[q27x WARN] TURNING SPECULATIVE DECODING OFF — this checkpoint cannot use it.
-```
-
-Nothing else is lost: correctness, vision, context and concurrency are all
-unaffected. If you want MTP, switch to a checkpoint whose head matches its body
-(`Qwen/Qwen3.8-27B-FP8` or `Qwen/Qwen3.8-27B`).
-
-Two ROCm bugs also make speculative decoding unsafe on older images — they kill
+Two ROCm bugs also make speculative decoding unsafe on older images. They kill
 the **server**, not the request:
 
 | Issue | Symptom |
@@ -719,12 +712,23 @@ Where those 10.44 ms/token go:
 layers, on Triton kernels with no aiter path on ROCm. CUDA graphs are already
 on, so this is kernel cost, not launch overhead.
 
-### What did NOT work, and why
+### Scoreboard — every configuration tried
 
-**`Qwen/Qwen3.8-27B-FP8` + NEXTN: ~14 tok/s.** Roughly 7× worse, despite
-excellent speculation (accept len **3.55**, accept rate **0.85**). At that
-accept length 14 tok/s means **243 ms per forward pass** versus 10.44 ms on
-MXFP4 — a ~23× slower pass. The log says why:
+| Configuration | tok/s | outcome |
+|---|---:|---|
+| **MXFP4 + aiter, no speculation** | **96** | **use this** |
+| DSpark + triton attention | 32 | poor draft *and* slower backend |
+| FP8 + NEXTN | 14 | untuned FP8 GEMMs — 23× slower pass |
+| DSpark + aiter attention | — | crashes on first token (upstream bug) |
+| MXFP4 + NEXTN | — | will not load (BF16 MTP head, undeclared) |
+
+**Speculative decoding does not pay on this model, on this hardware, in this
+SGLang build** — for four independent reasons, so it is not one bug away from
+working. `SPECULATIVE` therefore defaults to `none`.
+
+**`Qwen/Qwen3.8-27B-FP8` + NEXTN: ~14 tok/s.** Excellent speculation (accept len
+**3.55**, rate **0.85**) on top of a catastrophically slow pass — 243 ms versus
+10.44 ms on MXFP4. The log says why:
 
 ```
 not found tuned config in .../a8w8_blockscale_bpreshuffle_tuned_gemm.csv
@@ -733,16 +737,47 @@ not found tuned config in .../a8w8_blockscale_bpreshuffle_tuned_gemm.csv
 
 for `N=34816/16384/14336/5120`, `K=5120/6144/17408` — Qwen3.8-27B's gate_up,
 qkv, o_proj and down_proj. **aiter has no tuned FP8 blockscale kernels for this
-model's shapes on gfx950**, and one path falls back to a plain torch GEMM. The
-MXFP4 path avoids this because `gemm_afp4wfp4` is Triton-autotuned rather than
-CSV-driven.
+model's shapes on gfx950**, and one path falls back to a plain torch GEMM.
+MXFP4 escapes this because `gemm_afp4wfp4` is Triton-autotuned, not CSV-driven.
 
-The lesson generalises: on this hardware the MXFP4 checkpoint's advantage is
-**tuned kernels**, not just smaller weights. Do not assume a smaller/faster
-format wins if its GEMM shapes are untuned.
+> **The generalisable lesson:** on this hardware MXFP4's advantage is **tuned
+> kernels**, not merely smaller weights. Do not assume a smaller or nominally
+> faster format wins if its GEMM shapes are untuned.
 
-MTP itself is clearly worth having — 3.5 accepted tokens per pass is a high
-rate. The FP8 checkpoint is just not the way to get it.
+**`RadixArk/Qwen3.8-27B-DSpark`: 32 tok/s.** Two independent regressions. Its
+draft quality is poor on this model — accept rate 0.15–0.36 against NEXTN's 0.85
+on the same weights. And it crashes outright on the aiter attention backend:
+
+```python
+# aiter_backend.py:1799 — unguarded
+custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+# triton_backend.py:564 — guarded
+and getattr(spec_info, "custom_mask", None) is not None
+```
+
+DSpark does not populate `custom_mask` (it masks via `mask_token_id` and a
+Markov head, not an EAGLE tree mask). Forcing `ATTENTION_BACKEND=triton` to dodge
+that made the forward pass **9× slower** — attention is cheap on aiter at one
+query token, and expensive on untuned Triton at 190k context with 8-token verify
+batches.
+
+DSpark also cannot use `--enable-linear-replayssm-spec`: that path folds through
+a KDA-only backend and Qwen3.8 is GDN. The script turns it off for you.
+
+### The real bottleneck, and it is not a flag
+
+69% of every token is the **Gated DeltaNet recurrence** — 48 of 64 layers, on
+Triton kernels tuned for CDNA3/Hopper tile shapes, with no aiter linear-attention
+path on ROCm at all. CUDA graphs are already on, so this is kernel cost, not
+launch overhead.
+
+No configuration in this repo fixes that. It needs CDNA4 tile-shape tuning in
+either aiter or SGLang's FLA kernels. If you want to raise it upstream, the
+one-line summary is:
+
+> Qwen3.8-27B MXFP4 on gfx950, 96 tok/s single-stream, 7.2 of 10.4 ms per token
+> in the GDN recurrence with CUDA graphs enabled; aiter has no linear-attn path
+> on ROCm so all 48 linear layers fall to Triton.
 
 **No throughput number here has been measured.** The bandwidth ceilings are
 arithmetic and the ~1.2–1.5× ReplaySSM figure is upstream's claim. When you run
