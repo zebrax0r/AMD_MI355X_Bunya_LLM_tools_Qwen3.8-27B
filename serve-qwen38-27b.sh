@@ -260,6 +260,15 @@ DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Qwen3.8-27B-DSpark}"
 # of churn yet — but the same failure mode applies the moment it gets one.
 DSPARK_REVISION="${DSPARK_REVISION:-}"
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
+# Quantization for the MTP draft. SGLang defaults the draft to the TARGET's
+# quantization, which is wrong for any checkpoint whose MTP head is stored at a
+# different precision from its body — and the default MXFP4 checkpoint is
+# exactly that. See the SPEC_DRAFT_QUANT block further down.
+#   auto     inspect the cached checkpoint and decide  (default)
+#   unquant  force a BF16/unquantised draft
+#   inherit  SGLang's own behaviour (draft = target quantization)
+#   <name>   any value from SGLang's --quantization choices
+SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-auto}"
 SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-}"
 SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-}"
 SPEC_NUM_DRAFT_TOKENS="${SPEC_NUM_DRAFT_TOKENS:-}"
@@ -1810,6 +1819,111 @@ else
     log "Found cached weights for $MODEL_ID."
 fi
 
+# ── The MTP head may not share the body's precision ─────────────────────────
+#
+# HIT FOR REAL ON BUN160, 23 AUG 2026:
+#
+#   File ".../sglang/srt/layers/parameter.py", line 223, in load_merged_column_weight
+#     assert param_data.shape == loaded_weight.shape
+#   AssertionError
+#
+# SGLang defaults the speculative draft to the TARGET model's quantization:
+#
+#   "If speculative_draft_model_quantization is specified, the draft model uses
+#    this quantization method. Otherwise, the draft model defaults to the same
+#    quantization as the target model."
+#
+# For amd/Qwen3.8-27B-Quark-AWQ-MXFP4 that is wrong. Its quantization_config
+# excludes 111 model.visual.* entries plus lm_head — and NOTHING ELSE. mtp.* is
+# not listed as excluded, yet all 15 MTP tensors are stored BF16. The config and
+# the tensors disagree, so SGLang builds a quantized MTP layer and then meets
+# unquantized weights:
+#
+#   expects (packed MXFP4, gate+up fused)   [34816, 2560]
+#   file has (BF16 gate_proj)               [17408, 5120]
+#
+# Not every checkpoint needs this. Qwen/Qwen3.8-27B-FP8 ships an FP8 MTP head
+# WITH weight_scale_inv tensors, so forcing 'unquant' there would break it the
+# other way. Hence: decide from the checkpoint, not from a rule of thumb.
+spec_quant_flag=()
+if [[ -n "$SPECULATIVE" && "$SPECULATIVE" != "dspark" ]]; then
+    resolved_draft_quant="$SPEC_DRAFT_QUANT"
+
+    if [[ "$SPEC_DRAFT_QUANT" == "auto" ]]; then
+        resolved_draft_quant="inherit"
+        # Only decidable once the weights are local. Before that, say so rather
+        # than guessing — 'download' comes first anyway.
+        if [[ "$weights_cached" -eq 1 ]]; then
+            mtp_verdict="$(MDIR="$weights_dir" python3 - <<'MTPPY' 2>/dev/null || true
+import glob, json, os, struct, sys
+
+root = os.environ["MDIR"]
+snaps = sorted(glob.glob(os.path.join(root, "snapshots", "*")))
+if not snaps:
+    sys.exit()
+
+names = set()
+for snap in snaps:
+    idx = os.path.join(snap, "model.safetensors.index.json")
+    if os.path.exists(idx):
+        try:
+            names |= set(json.load(open(idx))["weight_map"])
+        except Exception:
+            pass
+    for st in glob.glob(os.path.join(snap, "*.safetensors")):
+        try:
+            with open(st, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                hdr = json.loads(f.read(n))
+            names |= {k for k in hdr if k != "__metadata__"}
+        except Exception:
+            pass
+    if names:
+        break
+
+mtp = [k for k in names if k.startswith("mtp.")]
+if not mtp:
+    print("nomtp")
+elif any(("weight_scale" in k or "scale_inv" in k) for k in mtp):
+    print("quantized")
+else:
+    print("unquantized")
+MTPPY
+)"
+            case "$mtp_verdict" in
+                unquantized)
+                    resolved_draft_quant="unquant"
+                    log "MTP head is UNQUANTIZED in this checkpoint (no scale tensors under mtp.*)."
+                    log "  Passing --speculative-draft-model-quantization unquant, because SGLang"
+                    log "  would otherwise inherit the target's quantization and die during weight"
+                    log "  load with 'assert param_data.shape == loaded_weight.shape'."
+                    ;;
+                quantized)
+                    log "MTP head is quantized in this checkpoint — letting the draft inherit the target's quantization."
+                    ;;
+                nomtp)
+                    warn "No mtp.* tensors found in the cached checkpoint, but SPECULATIVE=$SPECULATIVE.
+  NEXTN needs an MTP head. Either this is the wrong checkpoint, or the cache is
+  incomplete — re-run './serve-qwen38-27b.sh download'."
+                    ;;
+                *)
+                    warn "Could not inspect the cached checkpoint for MTP precision; letting the
+  draft inherit the target's quantization. If startup dies in
+  load_merged_column_weight with an AssertionError, set SPEC_DRAFT_QUANT=unquant."
+                    ;;
+            esac
+        else
+            log "Weights not cached yet — cannot inspect the MTP head precision, so the draft"
+            log "  will inherit the target's quantization. Re-run after 'download' and this"
+            log "  resolves itself."
+        fi
+    fi
+
+    if [[ "$resolved_draft_quant" != "inherit" && -n "$resolved_draft_quant" ]]; then
+        spec_quant_flag=(--speculative-draft-model-quantization "$resolved_draft_quant")
+    fi
+fi
+
 # The DSpark draft is a SEPARATE checkpoint, and nothing above covers it. Without
 # this check a missing draft surfaces as
 #   RuntimeError: Cannot find any model weights with `RadixArk/Qwen3.8-27B-DSpark`
@@ -2303,6 +2417,8 @@ if [[ -n "$SPECULATIVE" ]]; then
 
     # The 3/1/4 preset fills itself in for NEXTN; these exist so you can move off
     # it deliberately. Empty = leave SGLang's choice alone.
+    spec_flags+=(${spec_quant_flag[@]+"${spec_quant_flag[@]}"})
+
     [[ -n "$SPEC_NUM_STEPS" ]]        && spec_flags+=(--speculative-num-steps "$SPEC_NUM_STEPS")
     [[ -n "$SPEC_EAGLE_TOPK" ]]       && spec_flags+=(--speculative-eagle-topk "$SPEC_EAGLE_TOPK")
     [[ -n "$SPEC_NUM_DRAFT_TOKENS" ]] && spec_flags+=(--speculative-num-draft-tokens "$SPEC_NUM_DRAFT_TOKENS")

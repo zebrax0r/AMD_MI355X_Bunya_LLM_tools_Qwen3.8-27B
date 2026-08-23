@@ -443,6 +443,35 @@ log line mentions.
 
 **Benchmarking without a control.** `lanes` includes one for a reason.
 
+**The MTP head may not share the body's precision.** Seen on bun160,
+23 Aug 2026:
+
+```
+File ".../sglang/srt/layers/parameter.py", line 223, in load_merged_column_weight
+  assert param_data.shape == loaded_weight.shape
+AssertionError
+```
+
+SGLang defaults the speculative draft to the **target's** quantization. For
+`amd/Qwen3.8-27B-Quark-AWQ-MXFP4` that is wrong. Its `quantization_config`
+excludes 111 `model.visual.*` entries plus `lm_head` — and nothing else. `mtp.*`
+is not listed as excluded, yet all 15 MTP tensors are stored BF16. The config
+and the tensors disagree, so SGLang builds a quantized MTP layer and then meets
+unquantized weights:
+
+| | shape |
+|---|---|
+| expects (packed MXFP4, gate+up fused) | `[34816, 2560]` |
+| file has (BF16 `gate_proj`) | `[17408, 5120]` |
+
+The fix is `--speculative-draft-model-quantization unquant`, which this repo
+passes for you. It is **not** universal, though: `Qwen/Qwen3.8-27B-FP8` ships an
+FP8 MTP head *with* `weight_scale_inv` tensors, and forcing `unquant` there
+breaks it the other way. So `SPEC_DRAFT_QUANT=auto` (the default) inspects the
+cached checkpoint for scale tensors under `mtp.*` and decides from the data
+rather than from the repo name. Override with `unquant` or `inherit` if you
+need to.
+
 **aiter's hardcoded `/tmp/aiter_configs`.** Seen on bun160, 23 Aug 2026. Every
 SGLang model module fails to import with
 

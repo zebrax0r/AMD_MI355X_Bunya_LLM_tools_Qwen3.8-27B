@@ -274,6 +274,31 @@ export SPECULATIVE="${SPECULATIVE:-nextn}"
 # sampling (temperature=0, no top_p, no top_k).
 export SPEC_GATE="${SPEC_GATE:-on}"
 
+# Quantization for the MTP draft.
+#
+# SGLang defaults the draft to the TARGET model's quantization. That is wrong
+# for any checkpoint whose MTP head is stored at a different precision from its
+# body, and the default MXFP4 checkpoint is exactly that: its
+# quantization_config excludes 111 model.visual.* entries plus lm_head and
+# NOTHING ELSE — mtp.* is not listed — yet all 15 MTP tensors are stored BF16.
+# SGLang therefore builds a quantized MTP layer and meets unquantized weights:
+#
+#   expects (packed MXFP4, gate+up fused)   [34816, 2560]
+#   file has (BF16 gate_proj)               [17408, 5120]
+#   -> assert param_data.shape == loaded_weight.shape   AssertionError
+#
+# Hit for real on bun160, 23 Aug 2026.
+#
+# This is NOT universal: Qwen/Qwen3.8-27B-FP8 ships an FP8 MTP head WITH
+# weight_scale_inv tensors, and forcing 'unquant' there breaks it the other way.
+# So 'auto' inspects the cached checkpoint for scale tensors under mtp.* and
+# decides from the data rather than from the repo name.
+#
+#   auto     inspect the checkpoint and decide  (default)
+#   unquant  force a BF16/unquantised draft
+#   inherit  SGLang's own behaviour (draft = target quantization)
+export SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-auto}"
+
 # Empty = SGLang's own 3/1/4 preset for NEXTN. Move off it deliberately.
 export SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-}"
 export SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-}"
