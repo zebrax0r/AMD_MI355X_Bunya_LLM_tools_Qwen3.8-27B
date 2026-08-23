@@ -251,7 +251,7 @@ beat the *other lane*, not whether either beat plain SGLang.
 `SPECULATIVE` defaults to **`none`**. This repo originally shipped `nextn` on the
 reasoning that single-card decode is bandwidth-bound and the MTP head is free.
 Measurement says otherwise — see the
-[scoreboard](#scoreboard--every-configuration-tried). Every route to speculation
+[scoreboard](#scoreboard-of-every-configuration-tried). Every route to speculation
 on this stack makes the forward pass cost more than it saves, because decode here
 is **not** bandwidth-bound.
 
@@ -712,7 +712,7 @@ Where those 10.44 ms/token go:
 layers, on Triton kernels with no aiter path on ROCm. CUDA graphs are already
 on, so this is kernel cost, not launch overhead.
 
-### Scoreboard — every configuration tried
+### Scoreboard of every configuration tried
 
 | Configuration | tok/s | outcome |
 |---|---:|---|
