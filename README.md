@@ -472,6 +472,33 @@ cached checkpoint for scale tensors under `mtp.*` and decides from the data
 rather than from the repo name. Override with `unquant` or `inherit` if you
 need to.
 
+**A stray directory named like the repo id shadows the repo id.** The sequel to
+the presharded failure below, seen on bun160 minutes later:
+
+```
+ValueError: Unrecognized model in amd/Qwen3.8-27B-Quark-AWQ-MXFP4.
+Should have a `model_type` key in its config.json.
+```
+
+…for a model whose `config.json` is fine, in a setup that had loaded the same
+weights successfully minutes earlier. Both transformers and SGLang resolve a
+model path by asking `os.path.isdir(model_name_or_path)` **first** and only
+falling back to the hub. So a directory literally named
+`./amd/Qwen3.8-27B-Quark-AWQ-MXFP4` in the working directory silently beats your
+cached snapshot — and since the presharded loader had created it containing only
+`presharded/`, there is no `config.json` inside.
+
+One bad `presharded` start therefore poisons every later start until the
+directory is removed:
+
+```bash
+rm -rf ./amd
+```
+
+This repo now refuses to start when such a directory exists without a
+`config.json`, and names the `rm` for you. A directory that *does* contain a
+`config.json` is a legitimate local checkpoint and is used as-is.
+
 **`LOAD_FORMAT=presharded` breaks the speculative draft.** Seen on bun160,
 23 Aug 2026 — the target model loads fine, then:
 

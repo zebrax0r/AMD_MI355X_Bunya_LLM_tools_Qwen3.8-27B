@@ -1827,6 +1827,52 @@ fi
 
 # ── Weights cache accounting ────────────────────────────────────────────────
 
+# ── A stray directory named like the repo id shadows the repo id ───────────
+#
+# HIT FOR REAL ON BUN160, 23 AUG 2026, as the sequel to the presharded failure
+# above. Both transformers and SGLang resolve a model path by asking
+# os.path.isdir(model_name_or_path) FIRST and only falling back to the hub. So
+# a directory literally named ./amd/Qwen3.8-27B-Quark-AWQ-MXFP4 sitting in the
+# working directory silently wins over the cached snapshot — and since that
+# directory holds only a presharded/ subdir, you get:
+#
+#   ValueError: Unrecognized model in amd/Qwen3.8-27B-Quark-AWQ-MXFP4.
+#   Should have a `model_type` key in its config.json.
+#
+# ...for a model whose config.json is perfectly fine, in a run that worked
+# minutes earlier. The presharded loader creates exactly such a directory when
+# it is given a relative root (see the loader_cfg block), so one bad start
+# poisons every later one until the directory is removed.
+#
+# A directory that DOES contain a config.json is a legitimate local checkpoint,
+# so leave that alone — this only fires on the broken shape.
+_shadow_seen=""
+for _shadow_root in "$PWD" "$SCRIPT_DIR"; do
+    _shadow_dir="$_shadow_root/$MODEL_ID"
+    [[ -d "$_shadow_dir" ]] || continue
+    # $PWD and $SCRIPT_DIR are usually the same directory; report once.
+    [[ "$_shadow_seen" == *"|$_shadow_dir|"* ]] && continue
+    _shadow_seen+="|$_shadow_dir|"
+    if [[ -f "$_shadow_dir/config.json" ]]; then
+        log "Using the local checkpoint directory $_shadow_dir (it has a config.json)."
+        continue
+    fi
+    die "A directory named after the model id is shadowing it, and it has no config.json:
+
+    $_shadow_dir
+
+  transformers and SGLang both test os.path.isdir(model_path) before falling
+  back to the hub, so this directory wins over your cached snapshot and startup
+  fails with 'Unrecognized model ... Should have a model_type key'.
+
+  It is almost certainly debris from a LOAD_FORMAT=presharded run that rooted
+  its dump at a relative <model_path>/presharded. Remove it:
+
+      rm -rf '$_shadow_dir'
+
+  and make sure LOAD_FORMAT is unset (see '$(basename "$ENV_FILE")')."
+done
+
 # HF hub layout: models--org--name
 weights_dir="$MODEL_CACHE_DIR/hub/models--${MODEL_ID//\//--}"
 weights_cached=0
