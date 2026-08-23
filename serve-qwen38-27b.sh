@@ -526,6 +526,26 @@ if [[ -n "$DSPARK_BLOCK_SIZE" && "$SPECULATIVE" != "dspark" ]]; then
     warn "DSPARK_BLOCK_SIZE=$DSPARK_BLOCK_SIZE is ignored while SPECULATIVE is '${SPECULATIVE:-off}'."
 fi
 
+# ── ReplaySSM spec-verify is NEXTN-only on this model ───────────────────────
+#
+# DSPARK and DFLASH commit through a backend fold that only exists for KDA
+# (kimi_linear) models. Qwen3.8 is Gated DeltaNet, not KDA, so the pair dies
+# during memory-pool setup -- after the weights are loaded:
+#
+#   ValueError: --enable-linear-replayssm-spec with DSPARK/DFLASH requires a
+#   KDA (kimi_linear) model; got a non-KDA model.
+#
+# (kv_cache_configurator.py: "a non-KDA model there would scatter a None
+# intermediate_ssm and crash".) REPLAYSSM_SPEC=1 is this repo's default because
+# it composes with NEXTN; it cannot compose with DSpark here. Turn it off
+# rather than making the user discover the rule. Hit on bun160, 23 Aug 2026.
+if [[ "$REPLAYSSM_SPEC" == "1" && "$SPECULATIVE" == "dspark" ]]; then
+    log "SPECULATIVE=dspark — turning REPLAYSSM_SPEC off (it is KDA-only with DSpark,
+  and Qwen3.8 is GDN). This costs nothing: the ring is a memory optimisation
+  for the verify step, not an accuracy or throughput feature."
+    REPLAYSSM_SPEC=0
+fi
+
 # ReplaySSM spec-verify is linear-chain only: server_args.py restricts it to
 # --speculative-eagle-topk in {None, 1}. Catch a contradictory pair here, not
 # after the weights are resident.

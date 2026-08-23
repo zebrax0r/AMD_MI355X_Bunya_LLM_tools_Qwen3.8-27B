@@ -688,19 +688,61 @@ from the Hugging Face tree API, tensor dtypes and the presence of the MTP head
 and vision tower by reading the safetensors header over HTTP range requests, and
 the layer/head/state arithmetic from `config.json`.
 
-### Verified on bun160, 23 Aug 2026
+### Measured on bun160, 23 Aug 2026
+
+First real numbers for this model on gfx950. As far as I can tell they do not
+exist anywhere else, so treat them as a starting point, not a spec.
 
 | | |
 |---|---|
 | GPU passthrough | `ROCM_MODE=rocm`, 1 × gfx950 |
-| Weight load | **18.04 GB** resident, `quant=quark`, ~10–18 s warm |
+| Weight load | **18.04 GB** resident, `quant=quark` |
 | Free after weights | 269.2 GB reported by SGLang |
 | Vision tower | loaded (`aiter_attn` multimodal backend) |
-| Tool calls + reasoning parser | `toolcheck` passes end to end |
-| Speculative decoding | auto-disabled — checkpoint cannot support it |
+| Tool calls + reasoning | `toolcheck` passes end to end |
 
-The 18.04 GB matches the 18.4 GiB predicted from the safetensors header, and
-`budget`'s static-pool arithmetic matches SGLang's own reported free memory.
+**Single-stream decode, MXFP4, no speculation: ~96 tok/s** at 120k context
+(~106 extrapolated to empty context — context costs almost nothing here:
+119k→124k moved it 96.08→95.21).
+
+Where those 10.44 ms/token go:
+
+| | ms |
+|---|---|
+| Weight stream (18.0 GB @ 8 TB/s) | 2.25 |
+| KV stream (7.9 GB @ 120k ctx) | 0.98 |
+| **memory-bound floor** | **3.24** → 309 tok/s |
+| **unaccounted** | **7.20** — 69% of every token |
+
+**You are not bandwidth-bound.** MXFP4 does its job; the weight stream is only
+2.25 ms. The remaining 7.2 ms is the Gated DeltaNet recurrence — 48 of 64
+layers, on Triton kernels with no aiter path on ROCm. CUDA graphs are already
+on, so this is kernel cost, not launch overhead.
+
+### What did NOT work, and why
+
+**`Qwen/Qwen3.8-27B-FP8` + NEXTN: ~14 tok/s.** Roughly 7× worse, despite
+excellent speculation (accept len **3.55**, accept rate **0.85**). At that
+accept length 14 tok/s means **243 ms per forward pass** versus 10.44 ms on
+MXFP4 — a ~23× slower pass. The log says why:
+
+```
+not found tuned config in .../a8w8_blockscale_bpreshuffle_tuned_gemm.csv
+... using torch solution:0
+```
+
+for `N=34816/16384/14336/5120`, `K=5120/6144/17408` — Qwen3.8-27B's gate_up,
+qkv, o_proj and down_proj. **aiter has no tuned FP8 blockscale kernels for this
+model's shapes on gfx950**, and one path falls back to a plain torch GEMM. The
+MXFP4 path avoids this because `gemm_afp4wfp4` is Triton-autotuned rather than
+CSV-driven.
+
+The lesson generalises: on this hardware the MXFP4 checkpoint's advantage is
+**tuned kernels**, not just smaller weights. Do not assume a smaller/faster
+format wins if its GEMM shapes are untuned.
+
+MTP itself is clearly worth having — 3.5 accepted tokens per pass is a high
+rate. The FP8 checkpoint is just not the way to get it.
 
 **No throughput number here has been measured.** The bandwidth ceilings are
 arithmetic and the ~1.2–1.5× ReplaySSM figure is upstream's claim. When you run
