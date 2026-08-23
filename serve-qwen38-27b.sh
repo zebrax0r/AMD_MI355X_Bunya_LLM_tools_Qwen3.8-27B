@@ -268,7 +268,15 @@ DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
 #   unquant  force a BF16/unquantised draft
 #   inherit  SGLang's own behaviour (draft = target quantization)
 #   <name>   any value from SGLang's --quantization choices
-SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-auto}"
+# OBSOLETE, kept only to warn anyone who still has it set. It never worked --
+# see the long comment at the MTP block below.
+SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-}"
+[[ -n "$SPEC_DRAFT_QUANT" && "$SPEC_DRAFT_QUANT" != "auto" ]] && \
+    warn "SPEC_DRAFT_QUANT=$SPEC_DRAFT_QUANT is OBSOLETE and ignored.
+  --speculative-draft-model-quantization cannot fix an unquantized MTP head:
+  setting the draft quantization to None makes model_config.py re-detect the
+  checkpoint's own quant_method. Remove it from $(basename "${Q27X_ENV:-qwen38-27b.env}").
+  The MTP mismatch is now detected automatically and disables NEXTN instead."
 SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-}"
 SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-}"
 SPEC_NUM_DRAFT_TOKENS="${SPEC_NUM_DRAFT_TOKENS:-}"
@@ -1922,10 +1930,12 @@ fi
 # other way. Hence: decide from the checkpoint, not from a rule of thumb.
 spec_quant_flag=()
 if [[ -n "$SPECULATIVE" && "$SPECULATIVE" != "dspark" ]]; then
-    resolved_draft_quant="$SPEC_DRAFT_QUANT"
-
-    if [[ "$SPEC_DRAFT_QUANT" == "auto" ]]; then
-        resolved_draft_quant="inherit"
+    # DELIBERATELY UNGATED. An earlier version ran this only when
+    # SPEC_DRAFT_QUANT was "auto", which meant anyone who had been told to set
+    # SPEC_DRAFT_QUANT=unquant (it does not work -- see below) silently skipped
+    # the safety check and got the AssertionError anyway. A knob that cannot fix
+    # the problem must not be able to suppress the check for it.
+    if true; then
         # Only decidable once the weights are local. Before that, say so rather
         # than guessing — 'download' comes first anyway.
         if [[ "$weights_cached" -eq 1 ]]; then
@@ -2053,9 +2063,9 @@ MTPPY
         fi
     fi
 
-    if [[ "$resolved_draft_quant" != "inherit" && -n "$resolved_draft_quant" ]]; then
-        spec_quant_flag=(--speculative-draft-model-quantization "$resolved_draft_quant")
-    fi
+    # No --speculative-draft-model-quantization is ever passed. 'unquant' is the
+    # obvious candidate and is a no-op: model_config.py re-detects the
+    # checkpoint's quant_method the moment the draft quantization is None.
 fi
 
 # The DSpark draft is a SEPARATE checkpoint, and nothing above covers it. Without

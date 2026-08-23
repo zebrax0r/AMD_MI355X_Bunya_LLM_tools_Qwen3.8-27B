@@ -485,6 +485,12 @@ checkpoint's safetensors header when available and falls back to `config.json`
 
 `SPEC_ALLOW_MIXED=1` overrides the guard and fails at weight load instead.
 
+`SPEC_DRAFT_QUANT` is obsolete and ignored — the script warns if you still have
+it set. It is called out because an earlier version of this repo gated the
+safety check on it, so setting `SPEC_DRAFT_QUANT=unquant` (which does nothing)
+silently suppressed the check that would have caught the problem. A knob that
+cannot fix a fault must never be able to hide it.
+
 **A stray directory named like the repo id shadows the repo id.** The sequel to
 the presharded failure below, seen on bun160 minutes later:
 

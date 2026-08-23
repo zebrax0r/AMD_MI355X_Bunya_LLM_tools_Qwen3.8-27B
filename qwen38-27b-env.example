@@ -274,34 +274,33 @@ export SPECULATIVE="${SPECULATIVE:-nextn}"
 # sampling (temperature=0, no top_p, no top_k).
 export SPEC_GATE="${SPEC_GATE:-on}"
 
-# MTP draft handling.
+# MTP draft handling — nothing to configure, but read this once.
 #
-# NEXTN needs the MTP head to be stored at the SAME precision the model config
-# says it is. amd/Qwen3.8-27B-Quark-AWQ-MXFP4 breaks that: it quantizes its body
-# to MXFP4 but ships its MTP head in BF16, and its quantization_config lists
-# only 111 model.visual.* entries plus lm_head as excluded -- mtp.* is not
-# declared. SGLang therefore builds a quantized MTP layer, meets BF16 weights,
-# and dies with
+# NEXTN needs the MTP head stored at the precision the model config claims.
+# amd/Qwen3.8-27B-Quark-AWQ-MXFP4 breaks that: MXFP4 body, BF16 MTP head, and a
+# quantization_config that lists only 111 model.visual.* entries plus lm_head as
+# excluded. mtp.* is not declared, so SGLang builds a quantized MTP layer, meets
+# BF16 weights, and dies with
 #     assert param_data.shape == loaded_weight.shape
 #     expecting [34816, 2560], finding [17408, 5120]
 #
-# THERE IS NO FLAG THAT FIXES THIS. --speculative-draft-model-quantization
-# unquant looks like the answer and is not: it sets the draft quantization to
-# None, and model_config.py then does
+# NO FLAG FIXES THIS. --speculative-draft-model-quantization unquant sets the
+# draft quantization to None, and model_config.py then does
 #     if self.quantization is None:
 #         self.quantization = quant_method
-# re-detecting 'quark' straight back out of the checkpoint. The draft path has
-# no explicit-unset guard (the target has one, the draft does not).
+# re-detecting 'quark' from the checkpoint. The target has an explicit-unset
+# guard; the draft path does not.
 #
-# So the script DETECTS the mismatch and turns speculative decoding off, rather
-# than failing at weight load. If you want NEXTN, use a checkpoint whose MTP
-# head matches its body -- Qwen/Qwen3.8-27B-FP8 (FP8 head with scales) or
-# Qwen/Qwen3.8-27B (all BF16). Both work.
+# The script therefore DETECTS the mismatch before launch and turns speculative
+# decoding off. For NEXTN, use a checkpoint whose MTP head matches its body:
+#     Qwen/Qwen3.8-27B-FP8   FP8 head with scales   -> works
+#     Qwen/Qwen3.8-27B       all BF16               -> works
 #
-#   auto     detect and disable when the checkpoint cannot support it (default)
-#   inherit  SGLang's own behaviour
-# Set SPEC_ALLOW_MIXED=1 to override the safety and fail at weight load instead.
-export SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-auto}"
+# SPEC_ALLOW_MIXED=1 overrides the guard and fails at weight load instead.
+export SPEC_ALLOW_MIXED="${SPEC_ALLOW_MIXED:-0}"
+
+# OBSOLETE. Ignored, and warned about if set. It never worked.
+export SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-}"
 
 # Empty = SGLang's own 3/1/4 preset for NEXTN. Move off it deliberately.
 export SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-}"
