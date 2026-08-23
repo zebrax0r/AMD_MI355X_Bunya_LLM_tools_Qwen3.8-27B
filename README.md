@@ -472,6 +472,37 @@ cached checkpoint for scale tensors under `mtp.*` and decides from the data
 rather than from the repo name. Override with `unquant` or `inherit` if you
 need to.
 
+**`LOAD_FORMAT=presharded` breaks the speculative draft.** Seen on bun160,
+23 Aug 2026 — the target model loads fine, then:
+
+```
+RuntimeError: Cannot find any model weights with `amd/Qwen3.8-27B-Quark-AWQ-MXFP4`
+```
+
+…for a checkpoint that is cached and that the target *just loaded*. In
+`_first_time_load_and_dump`:
+
+```python
+self._ensure_presharded_dir_writable(presharded_dir)   # os.makedirs(...)
+...
+self.load_weights_and_postprocess(...)                 # -> _prepare_weights()
+```
+
+With no `presharded_path` override the root is
+`os.path.join(model_path, "presharded")`, and the **draft's** `model_path` is
+still the bare repo id — so step 1 creates a *relative* directory
+`./amd/Qwen3.8-27B-Quark-AWQ-MXFP4/presharded/…` in your CWD, and step 2's
+`is_local = os.path.isdir(model_name_or_path)` is then `True`. The repo id gets
+treated as a local model directory, the glob for `*.safetensors` finds only
+`presharded/`, and it raises. The target escapes because SGLang rewrites *its*
+path to the absolute snapshot ("Found local HF snapshot …"); the draft's is not.
+
+**Leave `LOAD_FORMAT` empty.** Presharding exists for the sibling repo's
+1.4 TB / 213-shard / TP8 load. Here the checkpoint is a single 18.4 GiB file
+that loads in ~15 s, so it costs a second full copy on disk and buys nothing.
+If you set it anyway, this repo now requires `PRESHARDED_PATH` to be set and
+absolute, and gives the draft its own root under it.
+
 **aiter's hardcoded `/tmp/aiter_configs`.** Seen on bun160, 23 Aug 2026. Every
 SGLang model module fails to import with
 

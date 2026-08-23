@@ -377,6 +377,20 @@ export READY_TIMEOUT="${READY_TIMEOUT:-1800}"   # cold start budget, seconds
 # This checkpoint is ONE 18.4 GiB file, so threads buy little — a single file
 # is a single reader. It matters on the FP8 (66 files) and BF16 (18 files) rungs.
 export WEIGHT_LOAD_THREADS="${WEIGHT_LOAD_THREADS:-8}"
+# LEAVE THIS EMPTY. 'presharded' exists for the 1.4 TB / 213-shard / TP8 case
+# in the sibling repo, where redoing the quantised load every start is
+# expensive. Here the checkpoint is a SINGLE 18.4 GiB file that loads in about
+# 15 seconds at TP=1, so presharding costs a second full copy on disk and buys
+# close to nothing.
+#
+# If you do set it, PRESHARDED_PATH becomes MANDATORY and must be ABSOLUTE.
+# Left empty, SGLang roots the dump at <model_path>/presharded — and model_path
+# for the speculative draft is the bare repo id, so it creates a RELATIVE
+# directory in your CWD. The next weight lookup finds that directory, treats
+# the repo id as a local model dir, and dies with
+#     RuntimeError: Cannot find any model weights with `amd/Qwen3.8-27B-...`
+# even though the weights are cached and the TARGET model just loaded fine.
+# Hit for real on bun160, 23 Aug 2026. The script now refuses that combination.
 export LOAD_FORMAT="${LOAD_FORMAT:-}"
 export PRESHARDED_PATH="${PRESHARDED_PATH:-}"
 export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"

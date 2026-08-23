@@ -127,7 +127,7 @@ SHADOW_VARS=(MODEL_ID MODEL_CACHE_DIR SGLANG_IMAGE WEIGHTS_GB SERVED_MODEL_NAME
              SPECULATIVE TP_SIZE CONTEXT_LEN MEM_FRACTION SIF_PATH
              KV_CACHE_DTYPE MAX_RUNNING_REQUESTS ENABLE_MULTIMODAL
              REPLAYSSM_SPEC REPLAYSSM_DECODE MAMBA_RADIX_STRATEGY
-             AITER_CONFIG_DIR)
+             AITER_CONFIG_DIR LOAD_FORMAT PRESHARDED_PATH SPEC_DRAFT_QUANT)
 SHADOWED=()
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -472,6 +472,35 @@ fi
 if [[ -n "$PRESHARDED_PATH" && "$LOAD_FORMAT" != "presharded" ]]; then
     warn "PRESHARDED_PATH is set but LOAD_FORMAT is '${LOAD_FORMAT:-auto}' — the path will be ignored.
   Set LOAD_FORMAT=presharded to use it."
+fi
+
+# ── presharded needs an ABSOLUTE root, or it writes relative paths ──────────
+#
+# SGLang's PreshardedModelLoader falls back to
+# os.path.join(model_config.model_path, "presharded") when no root is given.
+# With a bare repo id as model_path that is a RELATIVE directory created in the
+# CWD, which then shadows the repo id for the very next weight lookup — see the
+# long comment at the loader_cfg block below. So refuse rather than produce it.
+if [[ "$LOAD_FORMAT" == "presharded" ]]; then
+    warn "LOAD_FORMAT=presharded on a checkpoint this size is very likely a mistake.
+  Presharding exists for the 1.4 TB / 213-shard / TP8 case, where re-doing the
+  quantised load every start is expensive. Here the checkpoint is a SINGLE
+  ${WEIGHTS_GB} GB file that loads in about 15 seconds at TP=${TP_SIZE}, so presharding
+  costs you a second full copy on disk and buys close to nothing.
+  Unset LOAD_FORMAT in $ENV_FILE unless you have measured a reason to keep it."
+    [[ -n "$PRESHARDED_PATH" ]] \
+        || die "LOAD_FORMAT=presharded requires PRESHARDED_PATH to be set to an ABSOLUTE path.
+  Left empty, SGLang roots the dump at <model_path>/presharded — and model_path
+  is the bare repo id '$MODEL_ID', so it creates a RELATIVE directory in the
+  current working directory. The next weight lookup then finds that directory,
+  treats the repo id as a local model dir, and dies with
+      RuntimeError: Cannot find any model weights with \`$MODEL_ID\`
+  even though the weights are cached and the target model just loaded fine.
+  Set PRESHARDED_PATH=/scratch/user/\$USER/qwen38-27b/presharded, or unset
+  LOAD_FORMAT (recommended)."
+    [[ "$PRESHARDED_PATH" == /* ]] \
+        || die "PRESHARDED_PATH must be an ABSOLUTE path, got '$PRESHARDED_PATH'.
+  A relative root reproduces the same failure as leaving it empty."
 fi
 
 # The buffered multi-thread loader holds ~(num_threads + 2) shards in host RAM at
@@ -2791,16 +2820,38 @@ if (( WEIGHT_LOAD_THREADS > 0 )); then
     loader_cfg="\"enable_multithread_load\":true,\"num_threads\":$WEIGHT_LOAD_THREADS"
 fi
 
-if [[ "$LOAD_FORMAT" == "presharded" && -n "$PRESHARDED_PATH" ]]; then
-    # presharded takes its target root in the SAME extra-config object, so both
-    # settings have to be merged into one flag rather than passed twice.
+if [[ "$LOAD_FORMAT" == "presharded" ]]; then
+    # presharded takes its roots in the SAME extra-config object, so everything
+    # has to be merged into one flag rather than passed twice.
     [[ -n "$loader_cfg" ]] && loader_cfg+=","
     loader_cfg+="\"presharded_path\":\"$PRESHARDED_PATH\""
-    # The speculative draft is a separate model and gets its own root. Without
-    # it the draft dumps to <draft_model_path>/presharded — inside the HF cache,
-    # which is exactly the read-only mount upstream warns against.
-    if [[ "$SPECULATIVE" == "dspark" ]]; then
-        loader_cfg+=",\"draft_presharded_path\":\"$PRESHARDED_PATH/dspark\""
+    # THE DRAFT NEEDS ITS OWN ROOT, and not only for DSpark. NEXTN loads the MTP
+    # head as a separate draft model from the SAME repo id, so it goes through
+    # PreshardedModelLoader too. Without an override its root is
+    # os.path.join(model_config.model_path, "presharded") — and the draft's
+    # model_path is still the bare repo id, so that is a RELATIVE path.
+    #
+    # That is not merely untidy, it is fatal, and in a way the traceback hides.
+    # _first_time_load_and_dump() does:
+    #
+    #     self._ensure_presharded_dir_writable(presharded_dir)   # os.makedirs
+    #     ...
+    #     self.load_weights_and_postprocess(...)                 # _prepare_weights
+    #
+    # so step 1 creates ./amd/Qwen3.8-27B-Quark-AWQ-MXFP4/presharded/... in the
+    # CWD, and step 2's `is_local = os.path.isdir(model_name_or_path)` is then
+    # TRUE. The repo id is treated as a local model directory, the glob for
+    # *.safetensors finds only presharded/, and you get
+    #
+    #     RuntimeError: Cannot find any model weights with
+    #     `amd/Qwen3.8-27B-Quark-AWQ-MXFP4`
+    #
+    # ...for a checkpoint that is sitting in the cache and that the TARGET just
+    # loaded successfully. The target escapes because SGLang rewrites its path
+    # to the absolute snapshot dir ("Found local HF snapshot ..."); the draft's
+    # is left as the repo id. Hit for real on bun160, 23 Aug 2026.
+    if [[ -n "$SPECULATIVE" ]]; then
+        loader_cfg+=",\"draft_presharded_path\":\"$PRESHARDED_PATH/draft\""
     fi
 fi
 
