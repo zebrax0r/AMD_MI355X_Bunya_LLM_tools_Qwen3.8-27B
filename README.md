@@ -443,34 +443,47 @@ log line mentions.
 
 **Benchmarking without a control.** `lanes` includes one for a reason.
 
-**The MTP head may not share the body's precision.** Seen on bun160,
-23 Aug 2026:
+**NEXTN cannot run on the MXFP4 checkpoint, and no flag fixes it.** Seen on
+bun160, 23 Aug 2026:
 
 ```
-File ".../sglang/srt/layers/parameter.py", line 223, in load_merged_column_weight
-  assert param_data.shape == loaded_weight.shape
-AssertionError
+parameter.py:223 in load_merged_column_weight
+  assert param_data.shape == loaded_weight.shape       # [34816,2560] vs [17408,5120]
 ```
 
-SGLang defaults the speculative draft to the **target's** quantization. For
-`amd/Qwen3.8-27B-Quark-AWQ-MXFP4` that is wrong. Its `quantization_config`
-excludes 111 `model.visual.*` entries plus `lm_head` — and nothing else. `mtp.*`
-is not listed as excluded, yet all 15 MTP tensors are stored BF16. The config
-and the tensors disagree, so SGLang builds a quantized MTP layer and then meets
-unquantized weights:
+`amd/Qwen3.8-27B-Quark-AWQ-MXFP4` quantizes its body to MXFP4 but ships its MTP
+head in **BF16** — and its `quantization_config` declares only 111
+`model.visual.*` entries plus `lm_head` as excluded. `mtp.*` is **not** declared.
+So SGLang builds a quantized MTP layer and meets BF16 weights.
 
-| | shape |
-|---|---|
-| expects (packed MXFP4, gate+up fused) | `[34816, 2560]` |
-| file has (BF16 `gate_proj`) | `[17408, 5120]` |
+`--speculative-draft-model-quantization unquant` looks like the fix and is not.
+It sets the draft's quantization to `None`, and `model_config.py` immediately
+undoes it:
 
-The fix is `--speculative-draft-model-quantization unquant`, which this repo
-passes for you. It is **not** universal, though: `Qwen/Qwen3.8-27B-FP8` ships an
-FP8 MTP head *with* `weight_scale_inv` tensors, and forcing `unquant` there
-breaks it the other way. So `SPEC_DRAFT_QUANT=auto` (the default) inspects the
-cached checkpoint for scale tensors under `mtp.*` and decides from the data
-rather than from the repo name. Override with `unquant` or `inherit` if you
-need to.
+```python
+# Verify quantization configurations.
+if self.quantization is None:
+    self.quantization = quant_method    # re-detects "quark" from config.json
+```
+
+The **target** has an explicit-unset guard (`_quantization_explicitly_unset`);
+the **draft** path has none. So the draft is rebuilt quantized every time.
+
+This repo now detects the mismatch before launch and **turns speculative
+decoding off**, rather than failing after a weight load. Detection reads the
+checkpoint's safetensors header when available and falls back to `config.json`
+(always present, even mid-download) — if a quantized checkpoint does not list
+`mtp.*` as excluded, NEXTN cannot load it.
+
+**If you want NEXTN**, use a checkpoint whose MTP head matches its body:
+
+| Checkpoint | MTP head | NEXTN |
+|---|---|---|
+| `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` | BF16, undeclared | ✗ |
+| `Qwen/Qwen3.8-27B-FP8` | FP8 with `weight_scale_inv` | ✓ |
+| `Qwen/Qwen3.8-27B` | BF16, model is BF16 | ✓ |
+
+`SPEC_ALLOW_MIXED=1` overrides the guard and fails at weight load instead.
 
 **A stray directory named like the repo id shadows the repo id.** The sequel to
 the presharded failure below, seen on bun160 minutes later:

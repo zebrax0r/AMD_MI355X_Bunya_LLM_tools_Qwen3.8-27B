@@ -274,29 +274,33 @@ export SPECULATIVE="${SPECULATIVE:-nextn}"
 # sampling (temperature=0, no top_p, no top_k).
 export SPEC_GATE="${SPEC_GATE:-on}"
 
-# Quantization for the MTP draft.
+# MTP draft handling.
 #
-# SGLang defaults the draft to the TARGET model's quantization. That is wrong
-# for any checkpoint whose MTP head is stored at a different precision from its
-# body, and the default MXFP4 checkpoint is exactly that: its
-# quantization_config excludes 111 model.visual.* entries plus lm_head and
-# NOTHING ELSE — mtp.* is not listed — yet all 15 MTP tensors are stored BF16.
-# SGLang therefore builds a quantized MTP layer and meets unquantized weights:
+# NEXTN needs the MTP head to be stored at the SAME precision the model config
+# says it is. amd/Qwen3.8-27B-Quark-AWQ-MXFP4 breaks that: it quantizes its body
+# to MXFP4 but ships its MTP head in BF16, and its quantization_config lists
+# only 111 model.visual.* entries plus lm_head as excluded -- mtp.* is not
+# declared. SGLang therefore builds a quantized MTP layer, meets BF16 weights,
+# and dies with
+#     assert param_data.shape == loaded_weight.shape
+#     expecting [34816, 2560], finding [17408, 5120]
 #
-#   expects (packed MXFP4, gate+up fused)   [34816, 2560]
-#   file has (BF16 gate_proj)               [17408, 5120]
-#   -> assert param_data.shape == loaded_weight.shape   AssertionError
+# THERE IS NO FLAG THAT FIXES THIS. --speculative-draft-model-quantization
+# unquant looks like the answer and is not: it sets the draft quantization to
+# None, and model_config.py then does
+#     if self.quantization is None:
+#         self.quantization = quant_method
+# re-detecting 'quark' straight back out of the checkpoint. The draft path has
+# no explicit-unset guard (the target has one, the draft does not).
 #
-# Hit for real on bun160, 23 Aug 2026.
+# So the script DETECTS the mismatch and turns speculative decoding off, rather
+# than failing at weight load. If you want NEXTN, use a checkpoint whose MTP
+# head matches its body -- Qwen/Qwen3.8-27B-FP8 (FP8 head with scales) or
+# Qwen/Qwen3.8-27B (all BF16). Both work.
 #
-# This is NOT universal: Qwen/Qwen3.8-27B-FP8 ships an FP8 MTP head WITH
-# weight_scale_inv tensors, and forcing 'unquant' there breaks it the other way.
-# So 'auto' inspects the cached checkpoint for scale tensors under mtp.* and
-# decides from the data rather than from the repo name.
-#
-#   auto     inspect the checkpoint and decide  (default)
-#   unquant  force a BF16/unquantised draft
-#   inherit  SGLang's own behaviour (draft = target quantization)
+#   auto     detect and disable when the checkpoint cannot support it (default)
+#   inherit  SGLang's own behaviour
+# Set SPEC_ALLOW_MIXED=1 to override the safety and fail at weight load instead.
 export SPEC_DRAFT_QUANT="${SPEC_DRAFT_QUANT:-auto}"
 
 # Empty = SGLang's own 3/1/4 preset for NEXTN. Move off it deliberately.

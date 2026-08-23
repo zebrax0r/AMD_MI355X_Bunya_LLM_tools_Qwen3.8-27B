@@ -1934,8 +1934,6 @@ import glob, json, os, struct, sys
 
 root = os.environ["MDIR"]
 snaps = sorted(glob.glob(os.path.join(root, "snapshots", "*")))
-if not snaps:
-    sys.exit()
 
 names = set()
 for snap in snaps:
@@ -1956,35 +1954,96 @@ for snap in snaps:
     if names:
         break
 
+verdict = ""
 mtp = [k for k in names if k.startswith("mtp.")]
-if not mtp:
-    print("nomtp")
-elif any(("weight_scale" in k or "scale_inv" in k) for k in mtp):
-    print("quantized")
-else:
-    print("unquantized")
+if names and not mtp:
+    verdict = "nomtp"
+elif mtp and any(("weight_scale" in k or "scale_inv" in k) for k in mtp):
+    verdict = "quantized"
+elif mtp:
+    verdict = "unquantized"
+# Fall back to config.json, which is present in the snapshot even when the
+# weight files are not (a half-finished download, or a first run that has
+# not fetched them yet). If the checkpoint declares a quantization_config
+# and does NOT list mtp.* as excluded, SGLang will build a quantized MTP
+# layer -- and that is the whole failure, regardless of what the tensors
+# turn out to hold. This is the case that slipped through on bun160.
+if not verdict:
+    for snap in snaps:
+        cfgp = os.path.join(snap, "config.json")
+        if not os.path.exists(cfgp):
+            continue
+        try:
+            cfg = json.load(open(cfgp))
+        except Exception:
+            break
+        qc = cfg.get("quantization_config")
+        if not qc:
+            verdict = "quantized"      # nothing to mismatch
+        else:
+            ex = qc.get("exclude") or qc.get("ignore") or []
+            if not any("mtp" in str(e) for e in ex):
+                verdict = "unquantized"
+            else:
+                verdict = "quantized"
+        break
+
+print(verdict or "")
 MTPPY
 )"
             case "$mtp_verdict" in
                 unquantized)
-                    resolved_draft_quant="unquant"
-                    log "MTP head is UNQUANTIZED in this checkpoint (no scale tensors under mtp.*)."
-                    log "  Passing --speculative-draft-model-quantization unquant, because SGLang"
-                    log "  would otherwise inherit the target's quantization and die during weight"
-                    log "  load with 'assert param_data.shape == loaded_weight.shape'."
+                    # THIS COMBINATION CANNOT BE SERVED WITH NEXTN, and no flag
+                    # fixes it. --speculative-draft-model-quantization unquant
+                    # looks like the answer and is not: it resolves the draft's
+                    # quantization to None, and then model_config.py does
+                    #
+                    #     # Verify quantization configurations.
+                    #     if self.quantization is None:
+                    #         self.quantization = quant_method
+                    #
+                    # ...re-detecting 'quark' straight back out of the
+                    # checkpoint's own quantization_config. There is no
+                    # explicit-unset guard on the draft path (the target has
+                    # one, _quantization_explicitly_unset; the draft does not).
+                    # So the draft is rebuilt quantized and dies on the BF16
+                    # MTP weights every time. Verified on bun160, 23 Aug 2026.
+                    warn "TURNING SPECULATIVE DECODING OFF — this checkpoint cannot use it.
+
+  $MODEL_ID quantizes its body to MXFP4 but ships its MTP head in BF16, and its
+  quantization_config does not declare mtp.* as excluded (only 111 model.visual.*
+  entries and lm_head). SGLang therefore builds a quantized MTP layer, meets
+  BF16 weights, and dies with
+      assert param_data.shape == loaded_weight.shape
+  expecting [34816, 2560] and finding [17408, 5120].
+
+  --speculative-draft-model-quantization unquant does NOT fix this: it sets the
+  draft quantization to None and model_config.py then re-detects 'quark' from
+  the checkpoint. The draft path has no explicit-unset guard.
+
+  Serving WITHOUT speculative decoding. The MTP tensors are simply unused.
+  To keep NEXTN instead, use a checkpoint whose MTP head matches its body:
+      MODEL_ID=Qwen/Qwen3.8-27B-FP8    (FP8 MTP head, with scales — works)
+      MODEL_ID=Qwen/Qwen3.8-27B        (all BF16 — works)
+  Set SPEC_ALLOW_MIXED=1 to override this and fail at weight load instead."
+                    if [[ "${SPEC_ALLOW_MIXED:-0}" != "1" ]]; then
+                        SPECULATIVE=""
+                        REPLAYSSM_SPEC=0
+                    fi
                     ;;
                 quantized)
-                    log "MTP head is quantized in this checkpoint — letting the draft inherit the target's quantization."
+                    log "MTP head is quantized in this checkpoint — NEXTN can load it."
                     ;;
                 nomtp)
                     warn "No mtp.* tensors found in the cached checkpoint, but SPECULATIVE=$SPECULATIVE.
-  NEXTN needs an MTP head. Either this is the wrong checkpoint, or the cache is
-  incomplete — re-run './serve-qwen38-27b.sh download'."
+  NEXTN needs an MTP head. Turning speculative decoding off."
+                    SPECULATIVE=""; REPLAYSSM_SPEC=0
                     ;;
                 *)
-                    warn "Could not inspect the cached checkpoint for MTP precision; letting the
-  draft inherit the target's quantization. If startup dies in
-  load_merged_column_weight with an AssertionError, set SPEC_DRAFT_QUANT=unquant."
+                    warn "Could not inspect the cached checkpoint for MTP precision — the snapshot
+  has no weight files yet, or they are still downloading. Leaving speculative
+  decoding ON. If startup dies in load_merged_column_weight with an
+  AssertionError, that is this exact problem: set SPECULATIVE=none."
                     ;;
             esac
         else
